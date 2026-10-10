@@ -30,6 +30,9 @@
   figcaption { position: absolute; left: .5rem; bottom: .4rem; color: #fff; font-size: .85rem;
                background: #0009; padding: .15rem .5rem; border-radius: 4px; }
   figcaption .mic { margin-left: .3rem; }
+  .quality { position: absolute; right: .5rem; top: .4rem; color: #fff; font-size: .75rem;
+             background: #0009; padding: .1rem .4rem; border-radius: 4px; font-variant-numeric: tabular-nums; }
+  .quality:empty { display: none; }
   #controls { position: fixed; left: 0; right: 0; bottom: 0; display: none; gap: .5rem; justify-content: center;
               flex-wrap: wrap; padding: .75rem; background: #8882; backdrop-filter: blur(8px); }
   #controls.visible { display: flex; }
@@ -106,7 +109,9 @@ function personTile(name, label) {
   const cap = document.createElement("figcaption");
   cap.innerHTML = `<span class="who"></span><span class="mic"></span>`;
   cap.querySelector(".who").textContent = label || name;
-  fig.append(video, avatar, cap);
+  const quality = document.createElement("span");
+  quality.className = "quality";
+  fig.append(video, avatar, cap, quality);
   fig.classList.add("camera-off"); // until video arrives
   $("people").append(fig);
   p = { fig, video, muted: {} };
@@ -139,7 +144,9 @@ function screenTile(name, stream) {
     video.muted = name === state.me;
     const cap = document.createElement("figcaption");
     cap.textContent = (name === state.me ? "You" : name) + " – screen";
-    fig.append(video, cap);
+    const quality = document.createElement("span");
+    quality.className = "quality";
+    fig.append(video, cap, quality);
     $("screens").append(fig);
   }
   fig.querySelector("video").srcObject = stream;
@@ -229,10 +236,36 @@ async function negotiate() {
 // ---------- media ----------
 
 // addSource starts sending track as source on its own transceiver.
+// Sending quality per source. maxBitrate caps the encoder; degradationPreference
+// says what to give up when bandwidth is short: a screen keeps its resolution
+// (sharp text) and drops frames, a camera balances both.
+const QUALITY = {
+  camera: { maxBitrate: 2_500_000, degradationPreference: "balanced" },
+  screen: { maxBitrate: 4_000_000, degradationPreference: "maintain-resolution" },
+};
+const CAMERA_VIDEO = { width: { ideal: 1280 }, height: { ideal: 720 }, frameRate: { ideal: 30, max: 30 } };
+const SCREEN_VIDEO = { width: { max: 1920 }, height: { max: 1080 }, frameRate: { ideal: 30, max: 30 } };
+// Screen audio is music or video sound, not a voice: keep it unprocessed.
+const SCREEN_AUDIO = { echoCancellation: false, noiseSuppression: false, autoGainControl: false };
+
 function addSource(source, track, stream) {
-  const t = state.pub.addTransceiver(track, { direction: "sendonly", streams: [stream] });
+  const q = QUALITY[source];
+  const init = { direction: "sendonly", streams: [stream] };
+  if (q) init.sendEncodings = [{ maxBitrate: q.maxBitrate }];
+  const t = state.pub.addTransceiver(track, init);
   state.senders[source] = t.sender;
   state.tracks[source] = track;
+  if (q) applyDegradation(t.sender, q.degradationPreference);
+}
+
+async function applyDegradation(sender, preference) {
+  try {
+    const params = sender.getParameters();
+    params.degradationPreference = preference;
+    await sender.setParameters(params);
+  } catch (err) {
+    log("degradationPreference not supported:", err.message); // optional; quality still works
+  }
 }
 
 async function removeSource(source) {
@@ -247,7 +280,7 @@ async function removeSource(source) {
 async function getTrack(kind, deviceId) {
   const constraints = kind === "audio"
     ? { audio: deviceId ? { deviceId: { exact: deviceId } } : true }
-    : { video: deviceId ? { deviceId: { exact: deviceId } } : true };
+    : { video: deviceId ? { ...CAMERA_VIDEO, deviceId: { exact: deviceId } } : CAMERA_VIDEO };
   const stream = await navigator.mediaDevices.getUserMedia(constraints);
   return stream.getTracks()[0];
 }
@@ -346,8 +379,9 @@ async function switchDevice(kind) {
 
 async function toggleScreen() {
   if (state.senders.screen) return stopScreen();
-  const display = await navigator.mediaDevices.getDisplayMedia({ video: true, audio: true });
+  const display = await navigator.mediaDevices.getDisplayMedia({ video: SCREEN_VIDEO, audio: SCREEN_AUDIO });
   const video = display.getVideoTracks()[0];
+  video.contentHint = "detail"; // tells the encoder this is text and detail, not motion
   addSource("screen", video, display);
   const audio = display.getAudioTracks()[0];
   if (audio) addSource("screen-audio", audio, display);
@@ -377,6 +411,39 @@ function updateControls() {
   screen.disabled = !navigator.mediaDevices.getDisplayMedia;
   updateTile(state.me);
 }
+
+// ---------- quality overlay ----------
+
+// Every 2 seconds, show resolution, frame rate and bitrate on each video tile,
+// from the browser's own statistics: what we send for our own tiles, what we
+// receive for everyone else's.
+const lastBytes = new Map(); // track id -> { bytes, time }
+
+async function videoStats(fig) {
+  const video = fig.querySelector("video");
+  const track = video?.srcObject?.getVideoTracks()[0];
+  const label = fig.querySelector(".quality");
+  if (!track || track.readyState !== "live" || fig.classList.contains("camera-off")) { label.textContent = ""; return; }
+  const local = fig === people.get(state.me)?.fig || fig.id === "screen-" + state.me;
+  const pc = local ? state.pub : state.sub;
+  if (!pc) return;
+  const report = await pc.getStats(track);
+  for (const s of report.values()) {
+    if (s.type !== (local ? "outbound-rtp" : "inbound-rtp") || s.kind !== "video") continue;
+    const prev = lastBytes.get(track.id);
+    const bytes = local ? s.bytesSent : s.bytesReceived;
+    lastBytes.set(track.id, { bytes, time: s.timestamp });
+    const mbps = prev ? ((bytes - prev.bytes) * 8) / ((s.timestamp - prev.time) * 1000) : 0;
+    const size = s.frameWidth ? `${s.frameWidth}×${s.frameHeight}` : "–";
+    const fps = Math.round(s.framesPerSecond || 0);
+    label.textContent = `${size} · ${fps} fps · ${mbps.toFixed(1)} Mbps`;
+  }
+}
+
+setInterval(() => {
+  if (!state.joined) return;
+  document.querySelectorAll("#people figure, #screens figure").forEach((fig) => videoStats(fig).catch(() => {}));
+}, 2000);
 
 // ---------- join / leave ----------
 

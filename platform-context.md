@@ -87,6 +87,17 @@ transcoding. Single node, no auth yet.
   SFU for this reason.
 - **API docs are hand-written** (OpenAPI for HTTP, AsyncAPI for WebSocket). The
   viewers load from the unpkg CDN. No swaggo dependency.
+- **RTP header extensions are stripped before forwarding** (`stripExtensions` in
+  `router.go`). Their IDs are negotiated per connection, so the publisher's IDs
+  can mean something else on a subscriber's connection.
+- **Quality settings live in the page** (`QUALITY`, `CAMERA_VIDEO`, `SCREEN_VIDEO`):
+  - camera: 1280×720 at 30 fps, at most 2.5 Mbps, `balanced`;
+  - screen: up to 1920×1080 at 30 fps, at most 4 Mbps, `contentHint "detail"`,
+    `maintain-resolution`;
+  - screen audio: unprocessed;
+  - codec: VP8 (VP9 or AV1 and simulcast are planned for Phase 2).
+
+  Each tile shows resolution, fps and bitrate from `getStats`.
 - **Page controls:** mic mute = `track.enabled = false`. Camera off =
   `replaceTrack(null)` and stop the device (no renegotiation); camera on =
   `replaceTrack(newTrack)`. Screen = its own transceiver plus a re-offer.
@@ -113,7 +124,8 @@ transcoding. Single node, no auth yet.
 | `458ad6c` | Stage 5b: wiring in the app, ordered shutdown |
 | `52f8bdc` | Stage 6: `pkg/sfu`, integration tests, demo page, README |
 | `19ef4b2` | Controls stage A: track sources and stream IDs |
-| (uncommitted) | Controls stage B (roster, mute, writer goroutine), API docs, stage C (page controls), this file |
+| `a569b42` | Controls stage B (roster, mute, writer goroutine), API docs, stage C (page controls), this file |
+| (uncommitted) | Quality: strip RTP header extensions, camera and screen constraints and bitrates, quality overlay |
 
 ## Working agreements (from the user)
 

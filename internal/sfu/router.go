@@ -7,6 +7,7 @@ import (
 	"sync"
 
 	"github.com/pion/rtcp"
+	"github.com/pion/rtp"
 	"github.com/pion/webrtc/v4"
 
 	"github.com/mo-nada/sfu-engine/internal/peer"
@@ -174,10 +175,21 @@ func (r *Router) forward(t *publishedTrack) {
 		if err != nil {
 			break
 		}
+		stripExtensions(pkt)
 		// A write error only means one subscriber failed; the others still get the packet.
 		_ = t.local.WriteRTP(pkt)
 	}
 	r.unpublish(t)
+}
+
+// stripExtensions removes the RTP header extensions. Their IDs were
+// negotiated between the publisher and the SFU and can mean something else
+// on a subscriber's connection, where the browser would misread them (for
+// example as timing data). Nothing downstream needs them.
+func stripExtensions(pkt *rtp.Packet) {
+	pkt.Header.Extension = false
+	pkt.Header.ExtensionProfile = 0
+	pkt.Header.Extensions = nil
 }
 
 // unpublish removes t from every subscriber and renegotiates them.
