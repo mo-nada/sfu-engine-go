@@ -1,0 +1,194 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>SFU Engine – Room</title>
+<style>
+  :root { color-scheme: light dark; font-family: system-ui, sans-serif; }
+  body { margin: 0; padding: 1rem; max-width: 1100px; margin-inline: auto; }
+  h1 { font-size: 1.3rem; margin: 0 0 1rem; }
+  form { display: flex; gap: .5rem; flex-wrap: wrap; align-items: end; margin-bottom: 1rem; }
+  label { display: flex; flex-direction: column; font-size: .85rem; gap: .2rem; }
+  input { padding: .45rem .6rem; font-size: 1rem; border: 1px solid #8888; border-radius: 6px; }
+  button { padding: .5rem 1rem; font-size: 1rem; border: 0; border-radius: 6px; cursor: pointer; }
+  button[type=submit] { background: #2563eb; color: #fff; }
+  #leave { background: #dc2626; color: #fff; }
+  button:disabled { opacity: .5; cursor: default; }
+  #status { font-size: .9rem; margin-bottom: 1rem; }
+  #videos { display: grid; grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); gap: .75rem; }
+  figure { margin: 0; background: #000; border-radius: 8px; overflow: hidden; position: relative; aspect-ratio: 4 / 3; }
+  video { width: 100%; height: 100%; object-fit: cover; display: block; }
+  figcaption { position: absolute; left: .5rem; bottom: .4rem; color: #fff; font-size: .85rem;
+               background: #0008; padding: .1rem .4rem; border-radius: 4px; }
+  details { margin-top: 1rem; font-size: .8rem; }
+  #log { max-height: 220px; overflow: auto; background: #8881; padding: .5rem; white-space: pre-wrap; }
+</style>
+</head>
+<body>
+<h1>SFU Engine – join a room</h1>
+
+<form id="join-form">
+  <label>Room <input id="room" required pattern="[A-Za-z0-9_\-]{1,64}" value="room1"></label>
+  <label>Your name <input id="name" required pattern="[A-Za-z0-9_\-]{1,64}" placeholder="alice"></label>
+  <button type="submit" id="join">Join</button>
+  <button type="button" id="leave" disabled>Leave</button>
+</form>
+<div id="status">Not connected. Names: letters, digits, "-" or "_".</div>
+
+<div id="videos"></div>
+
+<details>
+  <summary>Log</summary>
+  <div id="log"></div>
+</details>
+
+<script>
+"use strict";
+// Protocol: see README "Signaling protocol". Two PeerConnections per client:
+// "publisher" (we offer, we send our camera) and "subscriber" (the SFU offers,
+// we receive everyone else's video).
+
+const $ = (id) => document.getElementById(id);
+let ws, pub, sub, localStream, joined = false;
+const pending = { publisher: [], subscriber: [] }; // ICE candidates before remote description
+const remoteTiles = new Map(); // participant -> {fig, stream}
+
+function log(...args) {
+  const line = new Date().toLocaleTimeString() + " " + args.join(" ");
+  console.log(line);
+  $("log").textContent += line + "\n";
+}
+function setStatus(text) { $("status").textContent = text; }
+function send(msg) { if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(msg)); }
+
+function addTile(id, label, stream, muted) {
+  let fig = document.getElementById("tile-" + id);
+  if (!fig) {
+    fig = document.createElement("figure");
+    fig.id = "tile-" + id;
+    const video = document.createElement("video");
+    video.autoplay = true;
+    video.playsInline = true;
+    video.muted = muted;
+    const cap = document.createElement("figcaption");
+    cap.textContent = label;
+    fig.append(video, cap);
+    $("videos").append(fig);
+  }
+  fig.querySelector("video").srcObject = stream;
+}
+function removeTile(id) { document.getElementById("tile-" + id)?.remove(); }
+
+function newPC(target) {
+  const pc = new RTCPeerConnection(); // no STUN needed on the same machine/LAN
+  pc.onicecandidate = (e) => {
+    if (e.candidate) send({ type: "candidate", target, candidate: e.candidate.toJSON() });
+  };
+  pc.onconnectionstatechange = () => log(target, "connection:", pc.connectionState);
+  return pc;
+}
+
+async function setRemote(target, pc, desc) {
+  await pc.setRemoteDescription(desc);
+  for (const c of pending[target].splice(0)) await pc.addIceCandidate(c).catch((e) => log("candidate error", e));
+}
+
+async function onMessage(msg) {
+  switch (msg.type) {
+    case "joined":
+      joined = true;
+      setStatus(`In room "${msg.room}" as "${msg.participant}".`);
+      log("joined", msg.room, "as", msg.participant);
+      await publish();
+      break;
+    case "answer": // answer to our publisher offer
+      await setRemote("publisher", pub, { type: "answer", sdp: msg.sdp });
+      break;
+    case "offer": { // the SFU offers on the subscriber connection
+      await setRemote("subscriber", sub, { type: "offer", sdp: msg.sdp });
+      const answer = await sub.createAnswer();
+      await sub.setLocalDescription(answer);
+      send({ type: "answer", sdp: answer.sdp });
+      break;
+    }
+    case "candidate": {
+      const pc = msg.target === "publisher" ? pub : sub;
+      if (!pc.remoteDescription) pending[msg.target].push(msg.candidate);
+      else await pc.addIceCandidate(msg.candidate).catch((e) => log("candidate error", e));
+      break;
+    }
+    case "error":
+      log("server error:", msg.message);
+      // Before "joined" (for example, the name is taken) the join failed: reset the form.
+      if (!joined) cleanup("Could not join: " + msg.message);
+      else setStatus("Error: " + msg.message);
+      break;
+  }
+}
+
+async function publish() {
+  for (const track of localStream.getTracks()) pub.addTransceiver(track, { direction: "sendonly", streams: [localStream] });
+  const offer = await pub.createOffer();
+  await pub.setLocalDescription(offer);
+  send({ type: "offer", sdp: offer.sdp });
+}
+
+async function join(room, name) {
+  setStatus("Starting camera…");
+  // Phase 1 forwards video only.
+  localStream = await navigator.mediaDevices.getUserMedia({ video: true, audio: false });
+  addTile("local", name + " (you)", localStream, true);
+
+  pub = newPC("publisher");
+  sub = newPC("subscriber");
+  sub.ontrack = (e) => {
+    // The SFU sets the stream ID to the publisher's participant name.
+    const stream = e.streams[0];
+    const who = stream ? stream.id : "unknown";
+    log("receiving video from", who);
+    addTile("remote-" + who, who, stream, true);
+    stream?.addEventListener("removetrack", () => {
+      if (stream.getTracks().length === 0) { log(who, "left"); removeTile("remote-" + who); }
+    });
+  };
+
+  const proto = location.protocol === "https:" ? "wss" : "ws";
+  ws = new WebSocket(`${proto}://${location.host}/ws`);
+  ws.onopen = () => { setStatus("Joining…"); send({ type: "join", room, participant: name }); };
+  ws.onmessage = (e) => onMessage(JSON.parse(e.data)).catch((err) => log("error:", err));
+  ws.onclose = () => { log("signaling closed"); cleanup("Disconnected."); };
+  setButtons(true);
+}
+
+function cleanup(text) {
+  if (ws) { ws.onclose = null; ws.close(); }
+  pub?.close(); sub?.close();
+  joined = false;
+  localStream?.getTracks().forEach((t) => t.stop());
+  ws = pub = sub = localStream = undefined;
+  pending.publisher = []; pending.subscriber = [];
+  $("videos").replaceChildren();
+  setButtons(false);
+  setStatus(text);
+}
+
+function setButtons(inRoom) {
+  $("join").disabled = inRoom;
+  $("leave").disabled = !inRoom;
+  $("room").disabled = inRoom;
+  $("name").disabled = inRoom;
+}
+
+$("join-form").addEventListener("submit", (e) => {
+  e.preventDefault();
+  join($("room").value.trim(), $("name").value.trim()).catch((err) => {
+    log("join failed:", err);
+    cleanup("Could not start: " + err.message);
+  });
+});
+$("leave").addEventListener("click", () => { send({ type: "leave" }); cleanup("You left the room."); });
+window.addEventListener("beforeunload", () => send({ type: "leave" }));
+</script>
+</body>
+</html>

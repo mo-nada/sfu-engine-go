@@ -47,17 +47,17 @@ func (c *testClient) addCandidate(ci webrtc.ICECandidateInit) {
 	_ = c.pc.AddICECandidate(ci)
 }
 
-func (c *testClient) setRemote(t *testing.T, sd webrtc.SessionDescription) {
+func (c *testClient) setRemote(sd webrtc.SessionDescription) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if err := c.pc.SetRemoteDescription(sd); err != nil {
-		t.Errorf("client set remote: %v", err)
-		return
+		return err
 	}
 	for _, ci := range c.pending {
 		_ = c.pc.AddICECandidate(ci)
 	}
 	c.pending = nil
+	return nil
 }
 
 // newServerPeer creates a server-side peer wired to client for trickle ICE.
@@ -118,7 +118,9 @@ func newPublisher(t *testing.T, api *webrtc.API, r *Router, id string) *publishe
 	if err != nil {
 		t.Fatalf("HandleOffer: %v", err)
 	}
-	client.setRemote(t, answer)
+	if err := client.setRemote(answer); err != nil {
+		t.Fatalf("client set remote: %v", err)
+	}
 	return &publisher{client: client, peer: srv, track: track, sender: sender, remote: remotes}
 }
 
@@ -152,21 +154,34 @@ func newSubscriber(t *testing.T, api *webrtc.API, r *Router, id string) *subscri
 	s := &subscriber{client: client, packets: make(map[string]int)}
 	s.peer = newServerPeer(t, api, client, id+"-sub")
 
+	// Registered after the client and peer, so it runs before they close:
+	// errors from answers still in progress during cleanup are expected.
+	var finished atomic.Bool
+	t.Cleanup(func() { finished.Store(true) })
+	fail := func(format string, args ...any) {
+		if !finished.Load() {
+			t.Errorf(format, args...)
+		}
+	}
+
 	s.peer.OnOffer(func(offer webrtc.SessionDescription) {
 		s.offers.Add(1)
 		go func() {
-			client.setRemote(t, offer)
+			if err := client.setRemote(offer); err != nil {
+				fail("client set remote: %v", err)
+				return
+			}
 			answer, err := client.pc.CreateAnswer(nil)
 			if err != nil {
-				t.Errorf("answer: %v", err)
+				fail("answer: %v", err)
 				return
 			}
 			if err := client.pc.SetLocalDescription(answer); err != nil {
-				t.Errorf("set local: %v", err)
+				fail("set local: %v", err)
 				return
 			}
 			if err := s.peer.HandleAnswer(answer); err != nil {
-				t.Errorf("HandleAnswer: %v", err)
+				fail("HandleAnswer: %v", err)
 			}
 		}()
 	})

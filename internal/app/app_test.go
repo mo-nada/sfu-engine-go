@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"strings"
 	"testing"
 	"time"
 
@@ -124,5 +125,36 @@ func TestShutdownClosesSignalingAndRooms(t *testing.T) {
 	}
 	if _, ok := a.rooms.Room("r1"); ok {
 		t.Error("room still exists after shutdown")
+	}
+}
+
+func TestServesDemoPage(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	a := newApp(t, config.Default())
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- a.Serve(ctx, ln) }()
+	defer func() { cancel(); <-done }()
+
+	resp, err := http.Get("http://" + ln.Addr().String() + "/")
+	if err != nil {
+		t.Fatalf("GET /: %v", err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK || !strings.Contains(string(body), "new WebSocket(") {
+		t.Errorf("GET / = %d, body does not look like the demo page", resp.StatusCode)
+	}
+
+	resp, err = http.Get("http://" + ln.Addr().String() + "/missing")
+	if err != nil {
+		t.Fatalf("GET /missing: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusNotFound {
+		t.Errorf("GET /missing = %d, want 404", resp.StatusCode)
 	}
 }

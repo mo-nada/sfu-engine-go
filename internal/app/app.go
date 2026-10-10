@@ -14,6 +14,7 @@ import (
 	"github.com/mo-nada/sfu-engine/internal/room"
 	"github.com/mo-nada/sfu-engine/internal/signaling"
 	"github.com/mo-nada/sfu-engine/internal/transport"
+	"github.com/mo-nada/sfu-engine/internal/web"
 )
 
 // App is the running SFU server.
@@ -26,7 +27,8 @@ type App struct {
 }
 
 // New creates an App from a validated config. It wires the Pion API, the
-// room manager and the WebSocket signaling handler at /ws.
+// room manager, the WebSocket signaling handler at /ws and the browser demo
+// page at /.
 func New(cfg config.Config, logger *slog.Logger) (*App, error) {
 	api, err := transport.NewAPI()
 	if err != nil {
@@ -41,6 +43,7 @@ func New(cfg config.Config, logger *slog.Logger) (*App, error) {
 		_, _ = w.Write([]byte("ok"))
 	})
 	mux.Handle("GET /ws", sig)
+	mux.Handle("GET /{$}", web.Handler())
 
 	return &App{
 		cfg:       cfg,
