@@ -3,6 +3,7 @@ package observability
 import (
 	"bytes"
 	"encoding/json"
+	"os"
 	"strings"
 	"testing"
 )
@@ -32,8 +33,32 @@ func TestNewLoggerText(t *testing.T) {
 		t.Fatalf("NewLogger: %v", err)
 	}
 	logger.Debug("peer connected", "peer_id", "p1")
-	if !strings.Contains(buf.String(), "peer_id=p1") {
-		t.Errorf("unexpected output: %s", buf.String())
+	out := buf.String()
+	if !strings.Contains(out, "peer connected") || !strings.Contains(out, "peer_id=p1") {
+		t.Errorf("unexpected output: %s", out)
+	}
+	if strings.Contains(out, "\x1b[") {
+		t.Errorf("output to a non-terminal must not contain color codes: %q", out)
+	}
+}
+
+func TestUseColor(t *testing.T) {
+	if useColor(&bytes.Buffer{}) {
+		t.Error("buffer: want no color")
+	}
+
+	f, err := os.CreateTemp(t.TempDir(), "log")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	if useColor(f) {
+		t.Error("regular file: want no color")
+	}
+
+	t.Setenv("NO_COLOR", "1")
+	if useColor(os.Stderr) {
+		t.Error("NO_COLOR set: want no color")
 	}
 }
 
