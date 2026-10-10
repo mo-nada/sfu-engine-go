@@ -57,11 +57,17 @@ func NewRouter(logger *slog.Logger) *Router {
 }
 
 // Publish starts forwarding remote, received on publisherID's publish peer,
-// to every other subscriber. It returns once forwarding has started.
-func (r *Router) Publish(publisherID string, publisher *peer.Peer, remote *webrtc.TrackRemote) error {
-	// The stream ID tells subscribers which participant the track belongs to.
+// to every other subscriber. source says what the track is (see Source*);
+// an unknown or empty source is replaced by the default for the track kind.
+// It returns once forwarding has started.
+//
+// Forwarding stops, and subscribers are renegotiated, when reading from
+// remote fails: when the publisher's peer closes, or when the publisher
+// removes the track and renegotiates.
+func (r *Router) Publish(publisherID, source string, publisher *peer.Peer, remote *webrtc.TrackRemote) error {
+	source = NormalizeSource(source, remote.Kind())
 	key := publisherID + "/" + remote.ID()
-	local, err := webrtc.NewTrackLocalStaticRTP(remote.Codec().RTPCodecCapability, key, publisherID)
+	local, err := webrtc.NewTrackLocalStaticRTP(remote.Codec().RTPCodecCapability, key, StreamID(publisherID, source))
 	if err != nil {
 		return err
 	}
@@ -92,7 +98,7 @@ func (r *Router) Publish(publisherID string, publisher *peer.Peer, remote *webrt
 	}
 	r.mu.Unlock()
 
-	r.logger.Info("track published", "track", key, "kind", remote.Kind().String(), "codec", remote.Codec().MimeType)
+	r.logger.Info("track published", "track", key, "source", source, "kind", remote.Kind().String(), "codec", remote.Codec().MimeType)
 	go r.forward(t)
 	r.negotiate(changed)
 	if len(changed) > 0 {

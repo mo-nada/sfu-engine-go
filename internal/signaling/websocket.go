@@ -103,6 +103,7 @@ type session struct {
 	participantID string
 	publisher     *peer.Peer
 	subscriber    *peer.Peer
+	trackSources  map[string]string // publisher track ID -> source, from the latest offer
 }
 
 func (s *session) readLoop() {
@@ -150,6 +151,19 @@ func (s *session) handle(msg Message) bool {
 
 	switch msg.Type {
 	case TypeOffer:
+		if len(msg.Tracks) > maxTracks {
+			s.sendError("too many tracks")
+			return true
+		}
+		// Each offer describes all tracks being sent, so its map replaces the
+		// previous one. Record it before applying the offer: OnTrack fires after.
+		sources := make(map[string]string, len(msg.Tracks))
+		for id, source := range msg.Tracks {
+			sources[id] = source
+		}
+		s.mu.Lock()
+		s.trackSources = sources
+		s.mu.Unlock()
 		answer, err := pub.HandleOffer(webrtc.SessionDescription{Type: webrtc.SDPTypeOffer, SDP: msg.SDP})
 		if err != nil {
 			logger.Warn("bad publisher offer", "err", err)
@@ -240,7 +254,10 @@ func (s *session) join(roomID, participantID string) {
 	s.mu.Unlock()
 
 	pub.OnTrack(func(remote *webrtc.TrackRemote, _ *webrtc.RTPReceiver) {
-		if err := r.Router().Publish(participantID, pub, remote); err != nil {
+		s.mu.Lock()
+		source := s.trackSources[remote.ID()]
+		s.mu.Unlock()
+		if err := r.Router().Publish(participantID, source, pub, remote); err != nil {
 			logger.Warn("publish failed", "err", err)
 		}
 	})

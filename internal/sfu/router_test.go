@@ -93,7 +93,7 @@ func newPublisher(t *testing.T, api *webrtc.API, r *Router, id string) *publishe
 	srv := newServerPeer(t, api, client, id+"-pub")
 	remotes := make(chan *webrtc.TrackRemote, 1)
 	srv.OnTrack(func(remote *webrtc.TrackRemote, _ *webrtc.RTPReceiver) {
-		if err := r.Publish(id, srv, remote); err != nil {
+		if err := r.Publish(id, "", srv, remote); err != nil {
 			t.Errorf("Publish: %v", err)
 		}
 		remotes <- remote
@@ -242,12 +242,12 @@ func TestForwardsVideoToAllOtherSubscribers(t *testing.T) {
 	defer close(stop)
 	go alice.sendVideo(stop)
 
-	eventually(t, "bob receives alice's video", func() bool { return bob.received("alice") >= 10 })
+	eventually(t, "bob receives alice's video", func() bool { return bob.received("alice/media") >= 10 })
 
 	carol := newSubscriber(t, api, r, "carol")
-	eventually(t, "carol (late joiner) receives alice's video", func() bool { return carol.received("alice") >= 10 })
+	eventually(t, "carol (late joiner) receives alice's video", func() bool { return carol.received("alice/media") >= 10 })
 
-	if n := aliceSub.received("alice"); n != 0 {
+	if n := aliceSub.received("alice/media"); n != 0 {
 		t.Errorf("alice received %d packets of her own track, want 0", n)
 	}
 	if n := aliceSub.offers.Load(); n != 0 {
@@ -295,7 +295,7 @@ func TestNewSubscriberRequestsKeyframe(t *testing.T) {
 
 	before := plis.Load()
 	bob := newSubscriber(t, api, r, "bob")
-	eventually(t, "bob receives video", func() bool { return bob.received("alice") > 0 })
+	eventually(t, "bob receives video", func() bool { return bob.received("alice/media") > 0 })
 	eventually(t, "publisher receives a PLI", func() bool { return plis.Load() > before })
 }
 
@@ -327,7 +327,7 @@ func TestPublishSameTrackTwiceFails(t *testing.T) {
 	case <-time.After(10 * time.Second):
 		t.Fatal("track not published")
 	}
-	if err := r.Publish("alice", alice.peer, remote); !errors.Is(err, ErrTrackExists) {
+	if err := r.Publish("alice", "", alice.peer, remote); !errors.Is(err, ErrTrackExists) {
 		t.Errorf("err = %v, want ErrTrackExists", err)
 	}
 	if n := r.trackCount(); n != 1 {
