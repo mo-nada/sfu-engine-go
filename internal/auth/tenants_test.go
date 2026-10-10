@@ -21,6 +21,7 @@ func TestNewTenantsValidates(t *testing.T) {
 		"empty key":    {{ID: "a", Secret: secretA}},
 		"dup key":      {{ID: "a", APIKey: "k", Secret: secretA}, {ID: "b", APIKey: "k", Secret: secretB}},
 		"short secret": {{ID: "a", APIKey: "k", Secret: "short"}},
+		"dup secret":   {{ID: "a", APIKey: "k1", Secret: secretA}, {ID: "b", APIKey: "k2", Secret: secretA}},
 	}
 	for name, list := range tests {
 		if _, err := NewTenants(list); err == nil {

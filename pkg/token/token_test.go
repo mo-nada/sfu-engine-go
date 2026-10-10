@@ -62,9 +62,10 @@ func TestVerifyRejects(t *testing.T) {
 		"alg none":     {noneAlg, ErrAlgorithm},
 		"tampered":     {tampered, ErrSignature},
 		"too long":     {mustSign(t, Claims{Issuer: "key1", Subject: "a", Room: "r", ExpiresAt: now.Add(48 * time.Hour).Unix()}), ErrInvalidClaims},
-		"nbf after exp": {mustSign(t, Claims{Issuer: "key1", Subject: "a", Room: "r", NotBefore: now.Add(2 * time.Hour).Unix(),
-			ExpiresAt: now.Add(time.Hour).Unix()}), ErrSignature /* not signable; see below */},
-		"newline":      {parts[0] + ".\n" + parts[1] + "." + parts[2], ErrMalformed},
+		// nbf is within the leeway, so only the nbf-after-exp rule rejects it.
+		"nbf after exp": {mustSign(t, Claims{Issuer: "key1", Subject: "a", Room: "r",
+			NotBefore: now.Add(20 * time.Second).Unix(), ExpiresAt: now.Add(10 * time.Second).Unix()}), ErrInvalidClaims},
+		"newline": {parts[0] + ".\n" + parts[1] + "." + parts[2], ErrMalformed},
 	}
 	for name, tt := range tests {
 		t.Run(name, func(t *testing.T) {
@@ -88,6 +89,7 @@ func TestSignRejectsInvalidClaims(t *testing.T) {
 		"bad identity": New("key1", "a b", "room1", time.Hour),
 		"bad room":     New("key1", "alice", "room/1", time.Hour),
 		"no issuer":    New("", "alice", "room1", time.Hour),
+		"nbf > exp":    {Issuer: "key1", Subject: "a", Room: "r", NotBefore: 200, ExpiresAt: 100},
 	} {
 		if _, err := Sign(secret, c); !errors.Is(err, ErrInvalidClaims) {
 			t.Errorf("%s: err = %v, want ErrInvalidClaims", name, err)

@@ -35,10 +35,11 @@ type Tenants struct {
 var validID = regexp.MustCompile(`^[A-Za-z0-9_-]{1,64}$`)
 
 // NewTenants validates list: IDs must be valid and unique, API keys unique
-// and non-empty, and secrets at least MinSecretLength bytes.
+// and non-empty, and secrets unique and at least MinSecretLength bytes.
 func NewTenants(list []Tenant) (*Tenants, error) {
 	t := &Tenants{byKey: make(map[string]Tenant, len(list))}
 	ids := make(map[string]bool, len(list))
+	secrets := make(map[string]bool, len(list))
 	var errs []error
 	for i, tn := range list {
 		switch {
@@ -52,8 +53,12 @@ func NewTenants(list []Tenant) (*Tenants, error) {
 			errs = append(errs, fmt.Errorf("tenant %q: api_key already used", tn.ID))
 		case len(tn.Secret) < MinSecretLength:
 			errs = append(errs, fmt.Errorf("tenant %q: secret must be at least %d bytes", tn.ID, MinSecretLength))
+		case secrets[tn.Secret]:
+			// A shared secret would let each tenant sign tokens as the other.
+			errs = append(errs, fmt.Errorf("tenant %q: secret already used by another tenant", tn.ID))
 		default:
 			ids[tn.ID] = true
+			secrets[tn.Secret] = true
 			t.byKey[tn.APIKey] = tn
 		}
 	}
