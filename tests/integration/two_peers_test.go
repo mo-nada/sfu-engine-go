@@ -15,6 +15,7 @@ import (
 	"github.com/pion/webrtc/v4"
 
 	sfuinternal "github.com/mo-nada/sfu-engine/internal/sfu"
+	"github.com/mo-nada/sfu-engine/internal/signaling"
 	"github.com/mo-nada/sfu-engine/pkg/sfu"
 	"github.com/mo-nada/sfu-engine/pkg/token"
 )
@@ -41,6 +42,10 @@ func startServer(t *testing.T) string {
 	done := make(chan error, 1)
 	go func() { done <- eng.Serve(ctx, ln) }()
 	t.Cleanup(func() {
+		// Close the test's idle API connections first. A spare connection the
+		// HTTP client opened but never used would otherwise hold up
+		// http.Server.Shutdown for up to 5 seconds, longer than the timeout here.
+		http.DefaultClient.CloseIdleConnections()
 		cancel()
 		select {
 		case err := <-done:
@@ -335,5 +340,114 @@ func TestAPIRemoveParticipantAndCloseRoom(t *testing.T) {
 	expectRemoved(t, carol)
 	if s := apiCall(t, url, "GET", "/v1/rooms/room1", ""); s != http.StatusNotFound {
 		t.Errorf("closed room: %d, want 404", s)
+	}
+}
+
+// flowing reports whether c keeps receiving packets of kind on stream.
+func flowing(c *client, stream string, kind webrtc.RTPCodecType) bool {
+	before := c.receivedKind(stream, kind)
+	time.Sleep(400 * time.Millisecond)
+	return c.receivedKind(stream, kind) > before
+}
+
+// The server API mutes a participant's microphone and changes permissions
+// live; media stops and resumes accordingly, and the clients are told.
+func TestAPIServerMuteAndPermissions(t *testing.T) {
+	url := startServer(t)
+	alice := newClient(t, url, "alice")
+	alice.join("room1")
+	bob := newClient(t, url, "bob")
+	bob.join("room1")
+
+	alice.publish(sfuinternal.SourceCamera, sfuinternal.SourceMicrophone)
+	eventually(t, "bob receives alice's camera and microphone", func() bool {
+		return bob.receivedKind("alice/media", webrtc.RTPCodecTypeVideo) >= 10 &&
+			bob.receivedKind("alice/media", webrtc.RTPCodecTypeAudio) >= 10
+	})
+
+	// Server mute of the microphone: audio stops, video continues.
+	if s := apiCall(t, url, "POST", "/v1/rooms/room1/participants/alice/mute", `{"source":"microphone","muted":true}`); s != http.StatusNoContent {
+		t.Fatalf("mute: %d", s)
+	}
+	select {
+	case msg := <-alice.mutes:
+		if msg.Participant != "alice" || msg.Source != "microphone" || !*msg.Muted || !msg.ByServer {
+			t.Errorf("alice got %+v, want her own server mute", msg)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("alice was not told about the server mute")
+	}
+	eventually(t, "alice's audio stops for bob", func() bool { return !flowing(bob, "alice/media", webrtc.RTPCodecTypeAudio) })
+	if !flowing(bob, "alice/media", webrtc.RTPCodecTypeVideo) {
+		t.Error("video stopped too")
+	}
+
+	// Alice cannot unmute herself.
+	f := false
+	alice.send(signaling.Message{Type: signaling.TypeMute, Source: "microphone", Muted: &f})
+	select {
+	case msg := <-alice.errors:
+		if msg != "muted by the server" {
+			t.Errorf("error = %q", msg)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("no error when unmuting a server mute")
+	}
+
+	// The server unmutes: audio resumes.
+	apiCall(t, url, "POST", "/v1/rooms/room1/participants/alice/mute", `{"source":"microphone","muted":false}`)
+	eventually(t, "alice's audio resumes", func() bool { return flowing(bob, "alice/media", webrtc.RTPCodecTypeAudio) })
+
+	// Permissions: alice may no longer publish the camera; bob may no longer subscribe.
+	if s := apiCall(t, url, "PATCH", "/v1/rooms/room1/participants/alice", `{"grants":{"sources":["microphone"]}}`); s != http.StatusOK {
+		t.Fatalf("patch alice: %d", s)
+	}
+	select {
+	case g := <-alice.perms:
+		if len(g.Sources) != 1 || g.Sources[0] != "microphone" {
+			t.Errorf("alice permissions = %+v", g)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("alice was not told about her new permissions")
+	}
+	eventually(t, "alice's camera stops for bob", func() bool { return !flowing(bob, "alice/media", webrtc.RTPCodecTypeVideo) })
+
+	if s := apiCall(t, url, "PATCH", "/v1/rooms/room1/participants/bob", `{"grants":{"subscribe":false}}`); s != http.StatusOK {
+		t.Fatalf("patch bob: %d", s)
+	}
+	eventually(t, "bob receives nothing", func() bool { return !flowing(bob, "alice/media", webrtc.RTPCodecTypeAudio) })
+
+	// Everything back on.
+	apiCall(t, url, "PATCH", "/v1/rooms/room1/participants/alice", `{"grants":{"sources":[]}}`)
+	apiCall(t, url, "PATCH", "/v1/rooms/room1/participants/bob", `{"grants":{"subscribe":true}}`)
+	eventually(t, "bob receives alice's camera and microphone again", func() bool {
+		return flowing(bob, "alice/media", webrtc.RTPCodecTypeVideo) && flowing(bob, "alice/media", webrtc.RTPCodecTypeAudio)
+	})
+}
+
+// A server mute cannot be undone by reconnecting with the same identity.
+func TestServerMuteSurvivesReconnect(t *testing.T) {
+	url := startServer(t)
+	bob := newClient(t, url, "bob")
+	bob.join("room1")
+	alice := newClient(t, url, "alice")
+	alice.join("room1")
+	alice.publish(sfuinternal.SourceCamera, sfuinternal.SourceMicrophone)
+	eventually(t, "bob receives alice's audio", func() bool { return bob.receivedKind("alice/media", webrtc.RTPCodecTypeAudio) >= 10 })
+
+	apiCall(t, url, "POST", "/v1/rooms/room1/participants/alice/mute", `{"source":"microphone","muted":true}`)
+	eventually(t, "alice's audio stops", func() bool { return !flowing(bob, "alice/media", webrtc.RTPCodecTypeAudio) })
+
+	alice.close()
+	eventually(t, "alice is gone", func() bool {
+		return apiCall(t, url, "DELETE", "/v1/rooms/room1/participants/alice", "") == http.StatusNotFound
+	})
+
+	again := newClient(t, url, "alice")
+	again.join("room1")
+	again.publish(sfuinternal.SourceCamera, sfuinternal.SourceMicrophone)
+	eventually(t, "bob receives the new alice's camera", func() bool { return flowing(bob, "alice/media", webrtc.RTPCodecTypeVideo) })
+	if flowing(bob, "alice/media", webrtc.RTPCodecTypeAudio) {
+		t.Error("reconnecting undid the server mute: audio flows again")
 	}
 }

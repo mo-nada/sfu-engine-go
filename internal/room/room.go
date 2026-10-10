@@ -1,11 +1,11 @@
 package room
 
 import (
-	"log/slog"
 	"sync"
 	"time"
 
 	"github.com/mo-nada/sfu-engine/internal/sfu"
+	"github.com/mo-nada/sfu-engine/pkg/token"
 )
 
 // Room is a group of participants that can exchange media.
@@ -22,6 +22,10 @@ type Room struct {
 	explicit bool
 	// emptyTimer removes an empty explicit room. Guarded by the Manager lock.
 	emptyTimer *time.Timer
+	// overrides keeps server changes per identity (permissions, server mutes)
+	// for the room's lifetime, so they survive a reconnect. Guarded by the
+	// Manager lock.
+	overrides map[string]*override
 
 	mu           sync.RWMutex
 	participants map[string]*Participant
@@ -35,15 +39,47 @@ type Options struct {
 	EmptyTimeout time.Duration
 }
 
-func newRoom(id string, opts Options, explicit bool, logger *slog.Logger) *Room {
+// newRoom creates a room whose router reports track events to m's observer.
+// It must be called with m.mu held.
+func (m *Manager) newRoom(id string, opts Options, explicit bool) *Room {
+	router := sfu.NewRouter(m.logger.With("room_id", id))
+	router.OnTrack(func(published bool, publisherID, source string) {
+		m.mu.Lock()
+		defer m.mu.Unlock()
+		if published {
+			m.obs.TrackPublished(id, publisherID, source)
+		} else {
+			m.obs.TrackUnpublished(id, publisherID, source)
+		}
+	})
 	return &Room{
 		id:           id,
-		router:       sfu.NewRouter(logger.With("room_id", id)),
+		router:       router,
 		createdAt:    time.Now(),
 		opts:         opts,
 		explicit:     explicit,
 		participants: make(map[string]*Participant),
 	}
+}
+
+// override is what the server API changed for one identity.
+type override struct {
+	grants      *token.Grants   // replaces the token's grants on join
+	serverMuted map[string]bool // source -> muted by the server
+}
+
+// override returns the identity's override, creating it. It must be called
+// with the Manager lock held.
+func (r *Room) override(id string) *override {
+	if r.overrides == nil {
+		r.overrides = make(map[string]*override)
+	}
+	ov := r.overrides[id]
+	if ov == nil {
+		ov = &override{serverMuted: make(map[string]bool)}
+		r.overrides[id] = ov
+	}
+	return ov
 }
 
 func (r *Room) count() int {

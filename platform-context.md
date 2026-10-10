@@ -18,8 +18,8 @@ microphone, screen). The REST API and signaling are what the SDKs call.
 Order of work:
 
 1. tenants and tokens — done;
-2. server API v1: 2a done (rooms, participants, tokens); 2b next (server-side
-   mute, permission updates);
+2. server API v1 — done (2a: rooms, participants, tokens; 2b: server mute,
+   live permissions, `auto_create_rooms`);
 3. client SDK (TypeScript);
 4. server SDKs (TypeScript, then Go);
 5. React SDK and a Next.js example;
@@ -56,15 +56,26 @@ on one node, shared store in Valkey or Redis).
 |---|---|
 | `cmd/sfu` | flags → `config.Load` → `observability.NewLogger` → `app.New` → `Run`; Ctrl+C or SIGTERM cancels ctx |
 | `internal/config` | `Config` (Addr, LogLevel, LogFormat, STUNURLs, ShutdownTimeout, TenantsFile, Tenants, Dev), flags, `Validate` (needs tenants or dev) |
-| `internal/auth` | `Tenant{ID, APIKey, Secret}`, `NewTenants` (validates: unique id, key and secret; secret ≥ 32 bytes), `LoadTenants(json)`, `DevTenant` (random secret), `VerifyJoinToken`, `VerifyAPIToken` |
+| `internal/auth` | `Tenant{ID, APIKey, Secret, AutoCreateRooms}` (default off: joins need an API-created room; dev tenant on), `NewTenants` (validates: unique id, key and secret; secret ≥ 32 bytes), `LoadTenants(json)`, `DevTenant` (random secret), `VerifyJoinToken`, `VerifyAPIToken` |
 | `pkg/token` | Public, stdlib only, JWT HS256. Join `Claims{iss=api key, sub, room, iat, nbf, exp ≤ 24 h, grants{publish, subscribe, sources}}` with `New`, `Sign`, `Verify`. API `APIClaims{iss, aud="sfu-api", iat, exp ≤ 1 h}` with `NewAPI`, `SignAPI`, `VerifyAPI`. The two kinds are not interchangeable. Strict base64, 30 s leeway |
-| `internal/api` | Server API `/v1`: Bearer API token → tenant in context. Routes: rooms (POST, GET list, GET one with participants, DELETE = close), participants (GET, DELETE = remove), POST tokens. Talks to rooms through the `Rooms` interface (`LocalRooms` wraps `room.Manager`; it will route to the owner node when scaling). Errors are `{"error": {code, message}}`; another tenant's room is `404` |
+| `internal/api` | Server API `/v1`: Bearer API token → tenant in context. Routes: rooms (POST, GET list, GET one with participants, DELETE = close), participants (GET, DELETE = remove, PATCH = permissions, POST …/mute = server mute), POST tokens. Talks to rooms through the `Rooms` interface (`LocalRooms` wraps `room.Manager`; it will route to the owner node when scaling). Errors are `{"error": {code, message}}`; another tenant's room is `404` |
 | `internal/observability` | `NewLogger`: tint colored text in a terminal (respects `NO_COLOR`), JSON otherwise |
 | `internal/app` | Wires the Pion API, tenants (file + programmatic + dev), `room.Manager`, `signaling.Handler`, routes (`/dev/token` only with `-dev`). `Serve` shutdown order: HTTP Shutdown → `signaling.Close` (parallel) → `rooms.Close` |
 | `internal/transport` | `NewAPI()` (default codecs and interceptors; one API is shared, Pion copies the MediaEngine per PC), `Configuration(stunURLs)` |
 | `internal/peer` | `Peer` = one PeerConnection. `HandleOffer` (client offers), `Negotiate` / `OnOffer` / `HandleAnswer` (server offers, **one offer in flight**, extra requests merged into one follow-up), early ICE candidate queue (max 64), `OnTrack`, `AddTrack` / `RemoveTrack`, `WriteRTCP`, `CreateDataChannel`, `Close` (idempotent; `OnClose` runs once, **outside** `sync.Once`) |
-| `internal/room` | `Manager` → `Room` → `Participant`. Explicit rooms (`Create` with `Options{MaxParticipants, EmptyTimeout}`) stay open while empty until the timeout; implicit rooms (created by a join) are removed when empty. `Remove` (kick) and `Delete` (close room) send `EventRemoved` first. `List(prefix)`, `Summary` and `Details` serve the API. Manager lock serializes Join, Leave and SetMuted **and the event notifications**, so all participants see events in one order. A Room owns one `sfu.Router`. A Participant owns two peers (publisher, subscriber), mute state, and a non-blocking `Notifier` |
-| `internal/sfu` | `Router` per room. `Publish(publisherID, source, peer, remoteTrack)`: one shared `TrackLocalStaticRTP` per published track, attached to every other subscriber. Read loop → `WriteRTP` (Pion copies to each subscriber). PLI when someone subscribes; subscriber PLI and FIR passed to the publisher. Track removed when `ReadRTP` fails. Sources and `StreamID` in `source.go` |
+| `internal/room` | `Manager` → `Room` → `Participant`. Explicit rooms (`Create` with `Options{MaxParticipants, EmptyTimeout}`) stay open while empty until the timeout; implicit rooms (created by a join) are removed when empty. `Remove` (kick) and `Delete` (close room) send `EventRemoved` first. `List(prefix)`, `Summary` and `Details` serve the API.
+  - `JoinExisting` is for tenants without auto-create.
+  - Each participant has its own `Grants` (from the token, then live through `UpdateGrants` → `EventGrants`).
+  - `ServerMute` → `EventMuted{ByServer}` goes to everyone, including the participant. A client unmute of a server-muted source gets `ErrServerMuted`.
+  - Leaving checks the **exact** `*Participant` under one lock hold (`LeaveParticipant`), so a late leave never removes a newer session with the same ID.
+  - Join adds the subscriber to the router **under the manager lock**, so it never races with permission changes.
+  - `ServerMute` and `UpdateGrants` change the participant, notify, and update the router all **under the manager lock**, so they never hit a newer session with the same identity, and concurrent PATCHes never lose changes.
+  - **Server changes persist per identity** for the room's lifetime (`Room.overrides`: grants that replace the token's, and server mutes). They are applied again on rejoin, so reconnecting cannot undo a mute or a revoked permission. The override is cleared only when the room is gone.
+  - On leave, the old session's tracks are `Retire`d (always silent until their read loop ends). Manager lock serializes Join, Leave and SetMuted **and the event notifications**, so all participants see events in one order. A Room owns one `sfu.Router`. A Participant owns two peers (publisher, subscriber), mute state, and a non-blocking `Notifier` |
+| `internal/sfu` | `Router` per room. `Publish(publisherID, source, peer, remoteTrack)`: one shared `TrackLocalStaticRTP` per published track, attached to every other subscriber. Read loop → `WriteRTP` (Pion copies to each subscriber). PLI when someone subscribes; subscriber PLI and FIR passed to the publisher. Track removed when `ReadRTP` fails. Sources and `StreamID` in `source.go`.
+  - `SetBlocked(pid, source, reason, on)` pauses forwarding while any reason (`server-mute`, `not-allowed`) is on. Packets are still read; on resume, a PLI is sent. It also applies to tracks published later.
+  - `Unsubscribe` removes the tracks from a peer that stays open, and renegotiates.
+  - `RemoveSubscriber` only removes the exact peer. |
 | `internal/signaling` | WebSocket `Handler`; one `session` per connection with **3 goroutines**: readLoop (handles messages in order), writeLoop (the only writer; `send` queues up to 256 and never blocks, and a full queue disconnects the slow client), pingLoop (30 s ping, 60 s pong timeout) |
 | `internal/web` | Embedded pages: `/` demo client, `/docs` (Swagger UI from CDN), `/docs/signaling` (AsyncAPI viewer from CDN) |
 | `api` | `openapi.yaml`, `asyncapi.yaml` (embedded, served at `/api/...`) |
@@ -154,7 +165,11 @@ on one node, shared store in Valkey or Redis).
 
 ## Known limitations
 
-- No server-side mute or permission updates yet (stage 2b), no webhooks, and no SDKs yet.
+- No SDKs, webhooks or admin API yet.
+- One unexplained test failure was seen once in about 100 repeated signaling
+  test runs (2026-10-10). It could not be reproduced and no output was kept. If
+  it shows up again, capture the output with
+  `go test -count=20 ./internal/signaling/ 2>&1 | tee /tmp/fail.txt`.
 - Single node (Platform Track stages 4–6).
 - Token revocation is not possible; keep tokens short-lived.
 - No TURN server.
@@ -179,7 +194,8 @@ on one node, shared store in Valkey or Redis).
 | `a569b42` | Controls stage B (roster, mute, writer goroutine), API docs, stage C (page controls), this file |
 | `b4d2775` | Quality: strip RTP header extensions, camera and screen constraints and bitrates, quality overlay |
 | `22c04e6` | CLAUDE.md Platform Track rules; Platform stage 1: tenants, join tokens, grants, dev mode |
-| (uncommitted) | CLAUDE.md product goal (LiveKit-like, SDKs); Platform stage 2a: API tokens, server API `/v1` (rooms, participants, tokens), `removed` message, room options |
+| `0fa590f` | CLAUDE.md product goal (LiveKit-like, SDKs); Platform stage 2a: API tokens, server API `/v1` (rooms, participants, tokens), `removed` message, room options |
+| (uncommitted) | Platform stage 2b: server mute, live permissions (`permissions` message), `auto_create_rooms` per tenant |
 
 ## Working agreements (from the user)
 

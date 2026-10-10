@@ -228,3 +228,78 @@ func TestCreateToken(t *testing.T) {
 		}
 	}
 }
+
+func TestServerMuteAndPermissions(t *testing.T) {
+	f := newFixture(t)
+	f.do(t, acme, "POST", "/v1/rooms", `{"name":"r1"}`, nil)
+	_, _ = f.rooms.Join("acme/r1", room.NewParticipant("alice", nil, nil, nil))
+
+	if s := f.do(t, acme, "POST", "/v1/rooms/r1/participants/alice/mute", `{"source":"microphone","muted":true}`, nil); s != http.StatusNoContent {
+		t.Fatalf("mute: status %d", s)
+	}
+	// The client cannot unmute a server mute.
+	if err := f.rooms.SetMuted("acme/r1", "alice", "microphone", false); err == nil {
+		t.Error("client unmuted a server mute")
+	}
+
+	var p participantJSON
+	if s := f.do(t, acme, "PATCH", "/v1/rooms/r1/participants/alice", `{"grants":{"sources":["camera"]}}`, &p); s != http.StatusOK {
+		t.Fatalf("patch: status %d", s)
+	}
+	// Only sources changed; publish and subscribe kept their values.
+	if !p.Grants.Publish || !p.Grants.Subscribe || len(p.Grants.Sources) != 1 || p.Grants.Sources[0] != "camera" {
+		t.Errorf("grants = %+v", p.Grants)
+	}
+	if !p.Muted["microphone"] {
+		t.Errorf("muted = %+v, want microphone muted", p.Muted)
+	}
+
+	for name, req := range map[string][3]string{
+		"bad source":    {"POST", "/v1/rooms/r1/participants/alice/mute", `{"source":"hologram","muted":true}`},
+		"missing muted": {"POST", "/v1/rooms/r1/participants/alice/mute", `{"source":"camera"}`},
+		"bad grant":     {"PATCH", "/v1/rooms/r1/participants/alice", `{"grants":{"sources":["x"]}}`},
+		"unknown field": {"PATCH", "/v1/rooms/r1/participants/alice", `{"role":"admin"}`},
+	} {
+		if s := f.do(t, acme, req[0], req[1], req[2], nil); s != http.StatusBadRequest {
+			t.Errorf("%s: status %d, want 400", name, s)
+		}
+	}
+	for name, req := range map[string][3]string{
+		"mute unknown":  {"POST", "/v1/rooms/r1/participants/bob/mute", `{"source":"camera","muted":true}`},
+		"patch unknown": {"PATCH", "/v1/rooms/r1/participants/bob", `{"grants":{}}`},
+		"other room":    {"PATCH", "/v1/rooms/nope/participants/alice", `{"grants":{}}`},
+	} {
+		if s := f.do(t, acme, req[0], req[1], req[2], nil); s != http.StatusNotFound {
+			t.Errorf("%s: status %d, want 404", name, s)
+		}
+	}
+	// Another tenant cannot touch acme's participant.
+	if s := f.do(t, globex, "POST", "/v1/rooms/r1/participants/alice/mute", `{"source":"camera","muted":true}`, nil); s != http.StatusNotFound {
+		t.Errorf("globex mute: status %d, want 404", s)
+	}
+}
+
+// Two PATCH requests that change different fields at the same time both take effect.
+func TestConcurrentPatchesKeepBothChanges(t *testing.T) {
+	f := newFixture(t)
+	f.do(t, acme, "POST", "/v1/rooms", `{"name":"r1"}`, nil)
+	for range 20 {
+		_, _ = f.rooms.Join("acme/r1", room.NewParticipant("alice", nil, nil, nil))
+		done := make(chan struct{}, 2)
+		go func() {
+			f.do(t, acme, "PATCH", "/v1/rooms/r1/participants/alice", `{"grants":{"subscribe":false}}`, nil)
+			done <- struct{}{}
+		}()
+		go func() {
+			f.do(t, acme, "PATCH", "/v1/rooms/r1/participants/alice", `{"grants":{"sources":["camera"]}}`, nil)
+			done <- struct{}{}
+		}()
+		<-done
+		<-done
+		d, _ := f.rooms.Details("acme/r1")
+		if g := d[0].Grants; g.Subscribe || len(g.Sources) != 1 {
+			t.Fatalf("grants = %+v, want subscribe=false and sources=[camera]", g)
+		}
+		f.rooms.Leave("acme/r1", "alice")
+	}
+}

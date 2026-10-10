@@ -12,7 +12,10 @@
 //	server → client  participant-joined {participant}
 //	server → client  participant-left   {participant}
 //	client → server  mute       {source, muted}      the client muted or unmuted a source
-//	server → client  mute       {participant, source, muted}  another participant did
+//	server → client  mute       {participant, source, muted, by_server}
+//	                                                 a participant (or the server) muted a
+//	                                                 source; by_server: the client cannot unmute
+//	server → client  permissions {grants}            the server changed your permissions
 //	client → server  offer      {sdp, tracks}        publish connection offer; tracks maps
 //	                                                 track ID → "camera", "microphone",
 //	                                                 "screen" or "screen-audio" for every
@@ -35,7 +38,11 @@
 package signaling
 
 import (
+	"encoding/json"
+
 	"github.com/pion/webrtc/v4"
+
+	"github.com/mo-nada/sfu-engine/pkg/token"
 )
 
 // Message types.
@@ -52,6 +59,7 @@ const (
 	TypeParticipantLeft   = "participant-left"
 	TypeMute              = "mute"
 	TypeRemoved           = "removed"
+	TypePermissions       = "permissions"
 )
 
 // Candidate targets.
@@ -73,6 +81,8 @@ type Message struct {
 	Message     string                   `json:"message,omitempty"`
 	Source      string                   `json:"source,omitempty"`
 	Muted       *bool                    `json:"muted,omitempty"`
+	ByServer    bool                     `json:"by_server,omitempty"`
+	Grants      *token.Grants            `json:"grants,omitempty"`
 	// Participants is set on "joined"; an empty room gives an empty list.
 	Participants []ParticipantInfo `json:"participants,omitzero"`
 }
@@ -85,3 +95,5 @@ type ParticipantInfo struct {
 
 // maxTracks bounds the size of an offer's tracks map.
 const maxTracks = 16
+
+func marshal(m Message) ([]byte, error) { return json.Marshal(m) }

@@ -39,24 +39,34 @@ type Manager struct {
 	mu     sync.Mutex
 	rooms  map[string]*Room
 	closed bool
+	obs    Observer
 }
 
 // NewManager creates an empty Manager.
 func NewManager(logger *slog.Logger) *Manager {
-	return &Manager{logger: logger, rooms: make(map[string]*Room)}
+	return &Manager{logger: logger, rooms: make(map[string]*Room), obs: NopObserver{}}
 }
+
+// SetObserver sets the lifecycle observer. Call it before the Manager is used.
+func (m *Manager) SetObserver(o Observer) { m.obs = o }
 
 // Join adds p to the room, creating the room if needed.
 func (m *Manager) Join(roomID string, p *Participant) (*Room, error) {
-	return m.join(roomID, p, true)
+	return m.join(roomID, p, true, Options{})
+}
+
+// JoinOrCreate adds p to the room, creating it with opts if needed. A room
+// created this way is removed when the last participant leaves.
+func (m *Manager) JoinOrCreate(roomID string, p *Participant, opts Options) (*Room, error) {
+	return m.join(roomID, p, true, opts)
 }
 
 // JoinExisting adds p to the room only if it exists (ErrRoomNotFound otherwise).
 func (m *Manager) JoinExisting(roomID string, p *Participant) (*Room, error) {
-	return m.join(roomID, p, false)
+	return m.join(roomID, p, false, Options{})
 }
 
-func (m *Manager) join(roomID string, p *Participant, create bool) (*Room, error) {
+func (m *Manager) join(roomID string, p *Participant, create bool, opts Options) (*Room, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -68,11 +78,20 @@ func (m *Manager) join(roomID string, p *Participant, create bool) (*Room, error
 	if !ok && !create {
 		return nil, ErrRoomNotFound
 	}
+	newlyCreated := false
 	if !ok {
-		r = newRoom(roomID, Options{}, false, m.logger)
+		r = m.newRoom(roomID, opts, false)
 		m.rooms[roomID] = r
+		newlyCreated = true
 		m.logger.Info("room created", "room_id", roomID)
 	}
+	// A room created for this join must not stay behind if the join fails.
+	defer func() {
+		if newlyCreated && r.count() == 0 {
+			delete(m.rooms, roomID)
+			r.router.Close()
+		}
+	}()
 	// A duplicate ID is reported as such even when the room is full.
 	if _, exists := r.Participant(p.ID()); exists {
 		return nil, ErrDuplicateParticipant
@@ -87,12 +106,29 @@ func (m *Manager) join(roomID string, p *Participant, create bool) (*Room, error
 		r.emptyTimer.Stop()
 		r.emptyTimer = nil
 	}
-	// Set this publisher's forwarding rules from scratch, so nothing is left
-	// over from an earlier session with the same ID.
+	// Server changes made earlier in this room (permissions, server mutes)
+	// still apply to this identity: reconnecting must not undo them.
+	ov := r.overrides[p.ID()]
+	if ov != nil && ov.grants != nil {
+		p.SetGrants(*ov.grants)
+	}
+	var serverMuted []string
+	if ov != nil {
+		for src, muted := range ov.serverMuted {
+			if muted {
+				serverMuted = append(serverMuted, src)
+				p.mu.Lock()
+				p.serverMuted[src], p.muted[src] = true, true
+				p.mu.Unlock()
+			}
+		}
+	}
+	// Set this publisher's forwarding rules from scratch, so nothing else is
+	// left over from an earlier session with the same ID.
 	g := p.Grants()
 	for _, src := range sfu.Sources {
 		r.router.SetBlocked(p.ID(), src, sfu.BlockNotAllowed, !g.AllowsSource(src))
-		r.router.SetBlocked(p.ID(), src, sfu.BlockServerMute, false)
+		r.router.SetBlocked(p.ID(), src, sfu.BlockServerMute, ov != nil && ov.serverMuted[src])
 	}
 
 	// Notify under the lock, so the roster and later events arrive in order.
@@ -103,7 +139,22 @@ func (m *Manager) join(roomID string, p *Participant, create bool) (*Room, error
 		o.send(Event{Kind: EventJoined, Participant: p.ID()})
 	}
 	p.send(Event{Kind: EventRoster, Roster: roster})
+	if ov != nil && ov.grants != nil {
+		p.send(Event{Kind: EventGrants, Grants: g})
+	}
+	for _, src := range serverMuted { // everyone, including p, learns the server mute
+		for _, o := range r.Participants() {
+			o.send(Event{Kind: EventMuted, Participant: p.ID(), Source: src, Muted: true, ByServer: true})
+		}
+	}
+	if p.subscriber != nil && g.Subscribe {
+		r.router.AddSubscriber(p.ID(), p.subscriber)
+	}
 
+	if newlyCreated {
+		m.obs.RoomStarted(roomID)
+	}
+	m.obs.ParticipantJoined(roomID, p.ID())
 	m.logger.Info("participant joined", "room_id", roomID, "participant_id", p.ID())
 	return r, nil
 }
@@ -168,6 +219,9 @@ func (m *Manager) leave(roomID, participantID string, want *Participant, reason 
 		p.send(Event{Kind: EventRemoved, Reason: reason})
 	}
 	_, remaining := r.remove(participantID)
+	// The old session's tracks end soon (when its peer closes); until then
+	// they must stay silent, whatever a rejoin with the same ID sets.
+	r.router.Retire(participantID, p.publisher)
 	removeRoom := remaining == 0 && !r.explicit
 	if removeRoom {
 		delete(m.rooms, roomID)
@@ -176,6 +230,10 @@ func (m *Manager) leave(roomID, participantID string, want *Participant, reason 
 	}
 	for _, o := range r.Participants() {
 		o.send(Event{Kind: EventLeft, Participant: participantID})
+	}
+	m.obs.ParticipantLeft(roomID, participantID, p.joinedAt)
+	if removeRoom {
+		m.obs.RoomFinished(roomID)
 	}
 	m.mu.Unlock()
 
@@ -215,9 +273,10 @@ func (m *Manager) Create(roomID string, opts Options) (*Room, error) {
 	if _, ok := m.rooms[roomID]; ok {
 		return nil, ErrRoomExists
 	}
-	r := newRoom(roomID, opts, true, m.logger)
+	r := m.newRoom(roomID, opts, true)
 	m.rooms[roomID] = r
 	m.startEmptyTimer(r)
+	m.obs.RoomStarted(roomID)
 	m.logger.Info("room created", "room_id", roomID, "max_participants", opts.MaxParticipants, "empty_timeout", opts.EmptyTimeout)
 	return r, nil
 }
@@ -235,6 +294,7 @@ func (m *Manager) startEmptyTimer(r *Room) {
 			return
 		}
 		delete(m.rooms, r.id)
+		m.obs.RoomFinished(r.id)
 		m.mu.Unlock()
 		r.router.Close()
 		m.logger.Info("room closed", "room_id", r.id, "reason", "empty timeout")
@@ -263,7 +323,9 @@ func (m *Manager) Delete(roomID, reason string) error {
 	removed := r.removeAll()
 	for _, p := range removed {
 		p.send(Event{Kind: EventRemoved, Reason: reason})
+		m.obs.ParticipantLeft(roomID, p.ID(), p.joinedAt)
 	}
+	m.obs.RoomFinished(roomID)
 	m.mu.Unlock()
 
 	r.router.Close()
@@ -278,20 +340,19 @@ func (m *Manager) Delete(roomID, reason string) error {
 
 // ServerMute mutes or unmutes participantID's source from the server: its
 // media stops (or resumes) for everyone, everyone including the participant
-// is told, and the participant cannot unmute it itself.
+// is told, and the participant cannot unmute it itself. The mute is kept for
+// the identity while the room exists, so reconnecting does not undo it.
+//
+// Everything, including the router change, happens under the Manager lock,
+// so it can never apply to a newer session with the same identity.
 func (m *Manager) ServerMute(roomID, participantID, source string, muted bool) error {
-	r, p, err := m.lookup(roomID, participantID)
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	r, p, err := m.lookupLocked(roomID, participantID)
 	if err != nil {
 		return err
 	}
-	p.applyMu.Lock()
-	defer p.applyMu.Unlock()
-
-	m.mu.Lock()
-	if cur, ok := r.Participant(participantID); !ok || cur != p {
-		m.mu.Unlock()
-		return ErrNotInRoom
-	}
+	r.override(participantID).serverMuted[source] = muted
 	p.mu.Lock()
 	p.serverMuted[source] = muted
 	p.muted[source] = muted
@@ -299,34 +360,38 @@ func (m *Manager) ServerMute(roomID, participantID, source string, muted bool) e
 	for _, o := range r.Participants() { // including the participant itself
 		o.send(Event{Kind: EventMuted, Participant: participantID, Source: source, Muted: muted, ByServer: true})
 	}
-	m.mu.Unlock()
-
 	r.router.SetBlocked(participantID, source, sfu.BlockServerMute, muted)
 	m.logger.Info("participant muted by the server", "room_id", roomID, "participant_id", participantID, "source", source, "muted", muted)
 	return nil
 }
 
-// UpdateGrants replaces participantID's permissions while it is in the room:
-// sources it may no longer publish stop being forwarded, and its incoming
-// media starts or stops with the subscribe permission. It is told the new
-// permissions.
-func (m *Manager) UpdateGrants(roomID, participantID string, g token.Grants) error {
-	r, p, err := m.lookup(roomID, participantID)
-	if err != nil {
-		return err
-	}
-	p.applyMu.Lock()
-	defer p.applyMu.Unlock()
-
+// UpdateGrants changes participantID's permissions while it is in the room.
+// change gets the current permissions and returns the new ones (or an
+// error, which is returned as is). Sources it may no longer publish stop
+// being forwarded, and its incoming media starts or stops with the subscribe
+// permission. It is told the new permissions. The new permissions are kept
+// for the identity while the room exists and replace the token's grants if
+// it reconnects.
+//
+// Everything happens under the Manager lock: concurrent updates never lose
+// each other's changes, and no change can apply to a newer session with the
+// same identity.
+func (m *Manager) UpdateGrants(roomID, participantID string, change func(token.Grants) (token.Grants, error)) (token.Grants, error) {
 	m.mu.Lock()
-	if cur, ok := r.Participant(participantID); !ok || cur != p {
-		m.mu.Unlock()
-		return ErrNotInRoom
+	defer m.mu.Unlock()
+	r, p, err := m.lookupLocked(roomID, participantID)
+	if err != nil {
+		return token.Grants{}, err
 	}
 	old := p.Grants()
+	g, err := change(old)
+	if err != nil {
+		return token.Grants{}, err
+	}
 	p.SetGrants(g)
+	saved := g
+	r.override(participantID).grants = &saved
 	p.send(Event{Kind: EventGrants, Grants: g})
-	m.mu.Unlock()
 
 	for _, src := range sfu.Sources {
 		r.router.SetBlocked(participantID, src, sfu.BlockNotAllowed, !g.AllowsSource(src))
@@ -341,12 +406,11 @@ func (m *Manager) UpdateGrants(roomID, participantID string, g token.Grants) err
 	}
 	m.logger.Info("participant permissions changed", "room_id", roomID, "participant_id", participantID,
 		"publish", g.Publish, "subscribe", g.Subscribe, "sources", g.Sources)
-	return nil
+	return g, nil
 }
 
-func (m *Manager) lookup(roomID, participantID string) (*Room, *Participant, error) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
+// lookupLocked must be called with m.mu held.
+func (m *Manager) lookupLocked(roomID, participantID string) (*Room, *Participant, error) {
 	r, ok := m.rooms[roomID]
 	if !ok {
 		return nil, nil, ErrRoomNotFound
@@ -446,6 +510,14 @@ func (m *Manager) Close() {
 	m.closed = true
 	rooms := m.rooms
 	m.rooms = make(map[string]*Room)
+	removed := make(map[string][]*Participant, len(rooms))
+	for id, r := range rooms {
+		removed[id] = r.removeAll()
+		for _, p := range removed[id] {
+			m.obs.ParticipantLeft(id, p.ID(), p.joinedAt)
+		}
+		m.obs.RoomFinished(id)
+	}
 	m.mu.Unlock()
 
 	for id, r := range rooms {
@@ -453,11 +525,43 @@ func (m *Manager) Close() {
 			r.emptyTimer.Stop()
 		}
 		r.router.Close()
-		for _, p := range r.removeAll() {
+		for _, p := range removed[id] {
 			if err := p.Close(); err != nil {
 				m.logger.Warn("participant close error", "room_id", id, "participant_id", p.ID(), "err", err)
 			}
 		}
 		m.logger.Info("room closed", "room_id", id)
 	}
+}
+
+// Stats is the manager's current load.
+type Stats struct {
+	Rooms              int
+	Participants       int
+	TenantRooms        map[string]int
+	TenantParticipants map[string]int
+}
+
+// Stats counts rooms and participants, in total and per tenant.
+func (m *Manager) Stats() Stats {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	s := Stats{TenantRooms: make(map[string]int), TenantParticipants: make(map[string]int)}
+	for id, r := range m.rooms {
+		tenant, _ := SplitRoomID(id)
+		n := r.count()
+		s.Rooms++
+		s.Participants += n
+		s.TenantRooms[tenant]++
+		s.TenantParticipants[tenant] += n
+	}
+	return s
+}
+
+// HasRoom reports whether the room exists on this node.
+func (m *Manager) HasRoom(roomID string) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	_, ok := m.rooms[roomID]
+	return ok
 }

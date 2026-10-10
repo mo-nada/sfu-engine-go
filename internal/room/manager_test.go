@@ -13,6 +13,7 @@ import (
 
 	"github.com/mo-nada/sfu-engine/internal/peer"
 	"github.com/mo-nada/sfu-engine/internal/transport"
+	"github.com/mo-nada/sfu-engine/pkg/token"
 )
 
 func discardLogger() *slog.Logger { return slog.New(slog.NewTextHandler(io.Discard, nil)) }
@@ -386,5 +387,44 @@ func TestLeaveParticipantOnlyRemovesItself(t *testing.T) {
 	r, _ := m.Room("t/r1")
 	if p, ok := r.Participant("alice"); !ok || p != fresh {
 		t.Error("the old session's leave removed the new session")
+	}
+}
+
+// Server mutes and permission changes survive a reconnect with the same identity.
+func TestServerChangesSurviveRejoin(t *testing.T) {
+	m := NewManager(discardLogger())
+	_, _ = m.Create("t/r1", Options{})
+	_, _ = m.Join("t/r1", NewParticipant("bob", nil, nil, nil)) // keeps the room busy
+	_, _ = m.Join("t/r1", NewParticipant("alice", nil, nil, nil))
+
+	if err := m.ServerMute("t/r1", "alice", "microphone", true); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := m.UpdateGrants("t/r1", "alice", func(g token.Grants) (token.Grants, error) {
+		g.Sources = []string{"microphone"}
+		return g, nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	m.Leave("t/r1", "alice")
+
+	rec := &recorder{}
+	again := NewParticipant("alice", nil, nil, rec.notify) // the token would give all sources
+	if _, err := m.Join("t/r1", again); err != nil {
+		t.Fatal(err)
+	}
+	if g := again.Grants(); len(g.Sources) != 1 || g.Sources[0] != "microphone" {
+		t.Errorf("grants after rejoin = %+v, want the server's change", g)
+	}
+	if err := m.SetMuted("t/r1", "alice", "microphone", false); !errors.Is(err, ErrServerMuted) {
+		t.Errorf("unmute after rejoin: err = %v, want ErrServerMuted", err)
+	}
+	var sawGrants, sawMute bool
+	for _, e := range rec.all() {
+		sawGrants = sawGrants || e.Kind == EventGrants
+		sawMute = sawMute || (e.Kind == EventMuted && e.ByServer && e.Source == "microphone")
+	}
+	if !sawGrants || !sawMute {
+		t.Errorf("rejoined alice was not told: grants=%v mute=%v", sawGrants, sawMute)
 	}
 }

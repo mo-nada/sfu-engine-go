@@ -34,6 +34,8 @@ type client struct {
 	joined  chan struct{}
 	errors  chan string
 	removed chan string // reason of a "removed" message
+	mutes   chan signaling.Message
+	perms   chan token.Grants
 	closed  chan struct{}
 
 	mu      sync.Mutex
@@ -62,6 +64,8 @@ func newClient(t *testing.T, wsURL, name string) *client {
 		joined:  make(chan struct{}),
 		errors:  make(chan string, 16),
 		removed: make(chan string, 1),
+		mutes:   make(chan signaling.Message, 16),
+		perms:   make(chan token.Grants, 16),
 		closed:  make(chan struct{}),
 		packets: make(map[string]int),
 		tracks:  make(map[string]int),
@@ -146,6 +150,10 @@ func (c *client) readLoop() {
 			c.errors <- msg.Message
 		case signaling.TypeRemoved:
 			c.removed <- msg.Message
+		case signaling.TypeMute:
+			c.mutes <- msg
+		case signaling.TypePermissions:
+			c.perms <- *msg.Grants
 		}
 	}
 }

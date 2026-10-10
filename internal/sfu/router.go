@@ -42,7 +42,14 @@ type Router struct {
 	// publisher ID -> source -> reasons (BlockServerMute, BlockNotAllowed).
 	blocked map[string]map[string]map[string]bool
 	closed  bool
+	// onTrack is told when a track starts or stops being forwarded. It is
+	// called without r.mu held.
+	onTrack func(published bool, publisherID, source string)
 }
+
+// OnTrack sets a callback for tracks starting (published) and stopping.
+// Call it before the router is used.
+func (r *Router) OnTrack(f func(published bool, publisherID, source string)) { r.onTrack = f }
 
 // Reasons for not forwarding a source.
 const (
@@ -61,6 +68,9 @@ type publishedTrack struct {
 	// paused stops forwarding without removing the track, so it can resume
 	// at once (server mute, or a source not allowed by the grants).
 	paused atomic.Bool
+	// retired tracks belong to a session that left; they stay silent until
+	// their read loop ends, whatever SetBlocked does for the same ID later.
+	retired atomic.Bool
 }
 
 // NewRouter creates an empty Router.
@@ -118,6 +128,9 @@ func (r *Router) Publish(publisherID, source string, publisher *peer.Peer, remot
 	r.mu.Unlock()
 
 	r.logger.Info("track published", "track", key, "source", source, "kind", remote.Kind().String(), "codec", remote.Codec().MimeType)
+	if r.onTrack != nil {
+		r.onTrack(true, publisherID, source)
+	}
 	go r.forward(t)
 	r.negotiate(changed)
 	if len(changed) > 0 {
@@ -187,6 +200,18 @@ func (r *Router) SetBlocked(publisherID, source, reason string, on bool) {
 	}
 }
 
+// Retire silences every track publisherID published through pub, for a
+// session that left. A newer session with the same ID is not affected.
+func (r *Router) Retire(publisherID string, pub *peer.Peer) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for _, t := range r.tracks {
+		if t.publisherID == publisherID && t.publisher == pub {
+			t.retired.Store(true)
+		}
+	}
+}
+
 // isBlocked must be called with r.mu held.
 func (r *Router) isBlocked(publisherID, source string) bool {
 	return len(r.blocked[publisherID][source]) > 0
@@ -227,7 +252,7 @@ func (r *Router) PublishedSources(publisherID string) []string {
 	defer r.mu.Unlock()
 	var out []string
 	for _, t := range r.tracks {
-		if t.publisherID == publisherID {
+		if t.publisherID == publisherID && !t.retired.Load() {
 			out = append(out, t.source)
 		}
 	}
@@ -280,7 +305,7 @@ func (r *Router) forward(t *publishedTrack) {
 		if err != nil {
 			break
 		}
-		if t.paused.Load() {
+		if t.paused.Load() || t.retired.Load() {
 			continue // read and drop, so Pion's buffers and RTCP keep working
 		}
 		stripExtensions(pkt)
@@ -323,6 +348,9 @@ func (r *Router) unpublish(t *publishedTrack) {
 	r.mu.Unlock()
 
 	r.logger.Info("track unpublished", "track", t.key)
+	if r.onTrack != nil {
+		r.onTrack(false, t.publisherID, t.source)
+	}
 	r.negotiate(changed)
 }
 

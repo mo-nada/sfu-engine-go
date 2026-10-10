@@ -1,10 +1,11 @@
-// Package auth holds the tenants and checks join tokens.
-//
-// Tenants come from a JSON file that every node loads, so all nodes agree.
-// (A later stage moves tenants into the shared store.)
+// Package auth checks join tokens and API tokens against the tenants and API
+// keys in the store. Lookups are cached for a few seconds, so a change made
+// through the admin API (a revoked key, a disabled tenant, new limits) takes
+// effect on every node within CacheTTL.
 package auth
 
 import (
+	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
@@ -12,15 +13,21 @@ import (
 	"fmt"
 	"os"
 	"regexp"
+	"sync"
 	"time"
 
+	"github.com/mo-nada/sfu-engine/internal/store"
 	"github.com/mo-nada/sfu-engine/pkg/token"
 )
 
-// MinSecretLength is the shortest accepted tenant secret, in bytes.
+// MinSecretLength is the shortest accepted secret, in bytes.
 const MinSecretLength = 32
 
-// Tenant is one customer system using the SFU.
+// CacheTTL is how long a key lookup is reused before asking the store again.
+const CacheTTL = 10 * time.Second
+
+// Tenant is a tenant as seen through one of its API keys. It is also the
+// format of a tenants file entry, used to seed the store.
 type Tenant struct {
 	ID     string `json:"id"`
 	APIKey string `json:"api_key"`
@@ -28,21 +35,63 @@ type Tenant struct {
 	// AutoCreateRooms lets a join create a room that does not exist. When
 	// false (the default), rooms must be created through the server API
 	// first, so their limits always apply and a closed room stays closed.
-	AutoCreateRooms bool `json:"auto_create_rooms"`
+	AutoCreateRooms bool         `json:"auto_create_rooms"`
+	Limits          store.Limits `json:"limits"`
+	WebhookURL      string       `json:"webhook_url"`
+	WebhookSecret   string       `json:"webhook_secret"`
 }
 
-// Tenants is an immutable set of tenants, safe for concurrent use.
+// ErrTenantDisabled is returned for tokens of a disabled tenant.
+var ErrTenantDisabled = errors.New("auth: tenant disabled")
+
+// Tenants authenticates tokens against the store. It is safe for concurrent use.
 type Tenants struct {
-	byKey map[string]Tenant
+	store store.Store
+
+	mu    sync.Mutex
+	cache map[string]cached // API key -> lookup result
+}
+
+type cached struct {
+	tenant Tenant
+	err    error
+	at     time.Time
 }
 
 var validID = regexp.MustCompile(`^[A-Za-z0-9_-]{1,64}$`)
 
-// NewTenants validates list: IDs must be valid and unique, API keys unique
-// and non-empty, and secrets unique and at least MinSecretLength bytes.
+// NewTenants returns Tenants backed by a new memory store seeded with list.
 func NewTenants(list []Tenant) (*Tenants, error) {
-	t := &Tenants{byKey: make(map[string]Tenant, len(list))}
+	return NewTenantsWithStore(context.Background(), store.NewMemory(), list)
+}
+
+// NewTenantsWithStore returns Tenants backed by s, after adding the seed
+// tenants and keys that are not in s yet. Seeds are validated: IDs must be
+// valid and unique, API keys unique and non-empty, and secrets unique and at
+// least MinSecretLength bytes.
+func NewTenantsWithStore(ctx context.Context, s store.Store, seed []Tenant) (*Tenants, error) {
+	if err := validate(seed); err != nil {
+		return nil, err
+	}
+	for _, tn := range seed {
+		err := s.CreateTenant(ctx, store.Tenant{
+			ID: tn.ID, Name: tn.ID, AutoCreateRooms: tn.AutoCreateRooms, Limits: tn.Limits,
+			WebhookURL: tn.WebhookURL, WebhookSecret: tn.WebhookSecret, CreatedAt: time.Now(),
+		})
+		if err != nil && !errors.Is(err, store.ErrExists) {
+			return nil, fmt.Errorf("seed tenant %q: %w", tn.ID, err)
+		}
+		err = s.CreateAPIKey(ctx, store.APIKey{Key: tn.APIKey, Secret: tn.Secret, TenantID: tn.ID, CreatedAt: time.Now()})
+		if err != nil && !errors.Is(err, store.ErrExists) {
+			return nil, fmt.Errorf("seed key of %q: %w", tn.ID, err)
+		}
+	}
+	return &Tenants{store: s, cache: make(map[string]cached)}, nil
+}
+
+func validate(list []Tenant) error {
 	ids := make(map[string]bool, len(list))
+	keys := make(map[string]bool, len(list))
 	secrets := make(map[string]bool, len(list))
 	var errs []error
 	for i, tn := range list {
@@ -53,7 +102,7 @@ func NewTenants(list []Tenant) (*Tenants, error) {
 			errs = append(errs, fmt.Errorf("tenant %q: duplicate id", tn.ID))
 		case tn.APIKey == "":
 			errs = append(errs, fmt.Errorf("tenant %q: api_key is empty", tn.ID))
-		case t.byKey[tn.APIKey].ID != "":
+		case keys[tn.APIKey]:
 			errs = append(errs, fmt.Errorf("tenant %q: api_key already used", tn.ID))
 		case len(tn.Secret) < MinSecretLength:
 			errs = append(errs, fmt.Errorf("tenant %q: secret must be at least %d bytes", tn.ID, MinSecretLength))
@@ -61,19 +110,14 @@ func NewTenants(list []Tenant) (*Tenants, error) {
 			// A shared secret would let each tenant sign tokens as the other.
 			errs = append(errs, fmt.Errorf("tenant %q: secret already used by another tenant", tn.ID))
 		default:
-			ids[tn.ID] = true
-			secrets[tn.Secret] = true
-			t.byKey[tn.APIKey] = tn
+			ids[tn.ID], keys[tn.APIKey], secrets[tn.Secret] = true, true, true
 		}
 	}
-	if len(errs) > 0 {
-		return nil, errors.Join(errs...)
-	}
-	return t, nil
+	return errors.Join(errs...)
 }
 
 // LoadTenants reads tenants from a JSON file:
-// {"tenants": [{"id", "api_key", "secret", "auto_create_rooms"}]}.
+// {"tenants": [{"id", "api_key", "secret", "auto_create_rooms", "limits", "webhook_url", "webhook_secret"}]}.
 func LoadTenants(path string) ([]Tenant, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
@@ -88,43 +132,88 @@ func LoadTenants(path string) ([]Tenant, error) {
 	return file.Tenants, nil
 }
 
+// NewSecret returns 32 random bytes, hex encoded.
+func NewSecret() string {
+	b := make([]byte, 32)
+	_, _ = rand.Read(b) // never fails on supported platforms
+	return hex.EncodeToString(b)
+}
+
 // DevTenant returns a tenant for local development with a random secret,
 // which changes on every start.
 func DevTenant() Tenant {
-	b := make([]byte, 32)
-	_, _ = rand.Read(b) // never fails on supported platforms
-	return Tenant{ID: "dev", APIKey: "devkey", Secret: hex.EncodeToString(b), AutoCreateRooms: true}
+	return Tenant{ID: "dev", APIKey: "devkey", Secret: NewSecret(), AutoCreateRooms: true}
 }
 
-// ByAPIKey returns the tenant with the given API key.
+// Store returns the store behind t.
+func (t *Tenants) Store() store.Store { return t.store }
+
+// ByAPIKey returns the active tenant of an active API key.
 func (t *Tenants) ByAPIKey(key string) (Tenant, bool) {
-	tn, ok := t.byKey[key]
-	return tn, ok
+	tn, err := t.lookup(key)
+	return tn, err == nil
 }
 
-// Len returns the number of tenants.
-func (t *Tenants) Len() int { return len(t.byKey) }
+// Forget drops this node's cached lookups, for example after an admin change.
+// Other nodes see the change within CacheTTL.
+func (t *Tenants) Forget() {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.cache = make(map[string]cached)
+}
+
+func (t *Tenants) lookup(key string) (Tenant, error) {
+	t.mu.Lock()
+	c, ok := t.cache[key]
+	t.mu.Unlock()
+	if ok && time.Since(c.at) < CacheTTL {
+		return c.tenant, c.err
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	k, st, err := t.store.LookupAPIKey(ctx, key)
+	var tn Tenant
+	switch {
+	case errors.Is(err, store.ErrNotFound):
+		err = token.ErrUnknownIssuer
+	case err != nil:
+		return Tenant{}, err // store unavailable: do not cache
+	case st.Disabled:
+		err = ErrTenantDisabled
+	default:
+		tn = Tenant{
+			ID: st.ID, APIKey: k.Key, Secret: k.Secret, AutoCreateRooms: st.AutoCreateRooms,
+			Limits: st.Limits, WebhookURL: st.WebhookURL, WebhookSecret: st.WebhookSecret,
+		}
+	}
+	t.mu.Lock()
+	t.cache[key] = cached{tenant: tn, err: err, at: time.Now()}
+	t.mu.Unlock()
+	return tn, err
+}
+
+// secretFor returns the secret of an active key of an active tenant.
+func (t *Tenants) secretFor(key string) (string, bool) {
+	tn, err := t.lookup(key)
+	return tn.Secret, err == nil
+}
 
 // VerifyJoinToken checks tok and returns its tenant and claims.
 func (t *Tenants) VerifyJoinToken(tok string, now time.Time) (Tenant, token.Claims, error) {
-	c, err := token.Verify(tok, func(key string) (string, bool) {
-		tn, ok := t.byKey[key]
-		return tn.Secret, ok
-	}, now)
+	c, err := token.Verify(tok, t.secretFor, now)
 	if err != nil {
 		return Tenant{}, token.Claims{}, err
 	}
-	return t.byKey[c.Issuer], c, nil
+	tn, err := t.lookup(c.Issuer)
+	return tn, c, err
 }
 
 // VerifyAPIToken checks an API token (see token.VerifyAPI) and returns its tenant.
 func (t *Tenants) VerifyAPIToken(tok string, now time.Time) (Tenant, error) {
-	c, err := token.VerifyAPI(tok, func(key string) (string, bool) {
-		tn, ok := t.byKey[key]
-		return tn.Secret, ok
-	}, now)
+	c, err := token.VerifyAPI(tok, t.secretFor, now)
 	if err != nil {
 		return Tenant{}, err
 	}
-	return t.byKey[c.Issuer], nil
+	return t.lookup(c.Issuer)
 }

@@ -1,6 +1,7 @@
 package signaling
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"log/slog"
@@ -38,9 +39,18 @@ type Handler struct {
 	logger   *slog.Logger
 	upgrader websocket.Upgrader
 
+	routing Routing // nil: everything is handled on this node
+	quota   Quota   // nil: no tenant limits
+
 	mu       sync.Mutex
 	sessions map[*session]struct{}
 	closed   bool
+}
+
+// SetPlatform enables multi-node routing and tenant limits. Call it before
+// serving.
+func (h *Handler) SetPlatform(routing Routing, quota Quota) {
+	h.routing, h.quota = routing, quota
 }
 
 // NewHandler creates a Handler. Joins must carry a token signed by one of
@@ -68,8 +78,9 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		conn:       conn,
 		logger:     h.logger.With("remote", r.RemoteAddr),
 		done:       make(chan struct{}),
-		out:        make(chan Message, sendQueueSize),
+		out:        make(chan []byte, sendQueueSize),
 		writerDone: make(chan struct{}),
+		routed:     r.Header.Get(RoutedHeader) != "",
 	}
 
 	h.mu.Lock()
@@ -116,13 +127,16 @@ type session struct {
 	logger *slog.Logger
 	done   chan struct{}
 
-	out        chan Message
+	out    chan []byte // encoded messages for writeLoop
+	routed bool        // forwarded by another node: never forward again
+
+	upstreamMu sync.Mutex
+	upstream   *websocket.Conn // set when this session forwards to the room's node
 	writerDone chan struct{}
 	closed     atomic.Bool
 
 	mu            sync.Mutex // guards the fields below, set once on join
 	joinLogger    *slog.Logger
-	grants        token.Grants
 	roomID        string // tenant-scoped room key: "<tenant>/<room>"
 	participant   *room.Participant
 	participantID string
@@ -143,6 +157,14 @@ func (s *session) readLoop() {
 		if err != nil {
 			return
 		}
+		if up := s.upstreamConn(); up != nil {
+			// Forwarding: pass the message to the room's node unchanged.
+			_ = up.SetWriteDeadline(time.Now().Add(writeTimeout))
+			if err := up.WriteMessage(websocket.TextMessage, data); err != nil {
+				return
+			}
+			continue
+		}
 		var msg Message
 		if err := json.Unmarshal(data, &msg); err != nil {
 			s.sendError("invalid JSON")
@@ -157,9 +179,13 @@ func (s *session) readLoop() {
 // handle processes one message. It returns false when the session must end.
 func (s *session) handle(msg Message) bool {
 	s.mu.Lock()
-	pub, sub, logger, grants := s.publisher, s.subscriber, s.joinLogger, s.grants
+	pub, sub, logger, participant := s.publisher, s.subscriber, s.joinLogger, s.participant
 	s.mu.Unlock()
 	joined := pub != nil
+	var grants token.Grants
+	if participant != nil {
+		grants = participant.Grants() // may be changed by the server API at any time
+	}
 
 	if msg.Type == TypeJoin {
 		if joined {
@@ -228,7 +254,11 @@ func (s *session) handle(msg Message) bool {
 		s.mu.Unlock()
 		if err := s.h.rooms.SetMuted(roomID, participantID, msg.Source, *msg.Muted); err != nil {
 			logger.Debug("mute failed", "err", err)
-			s.sendError("mute failed")
+			if errors.Is(err, room.ErrServerMuted) {
+				s.sendError("muted by the server")
+			} else {
+				s.sendError("mute failed")
+			}
 		}
 	case TypeLeave:
 		return false
@@ -254,6 +284,38 @@ func (s *session) join(tok string) {
 	roomName, participantID, grants := claims.Room, claims.Subject, claims.Grants
 	roomID := tenant.ID + "/" + roomName
 	logger := s.logger.With("tenant_id", tenant.ID, "room_id", roomName, "participant_id", participantID)
+
+	// The room may live on another node: forward the whole session there.
+	if s.h.routing != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		forwardURL, err := s.h.routing.RouteJoin(ctx, roomID, tenant.AutoCreateRooms, s.routed)
+		cancel()
+		if err != nil {
+			logger.Warn("join routing failed", "err", err)
+			s.sendError("room unavailable")
+			return
+		}
+		if forwardURL != "" {
+			s.forward(forwardURL, tok, logger)
+			return
+		}
+	}
+
+	// Tenant limits (counted across all nodes; a burst of joins can pass a
+	// limit by a few, because the counts are a few seconds old).
+	var opts room.Options
+	if q := s.h.quota; q != nil {
+		lim := tenant.Limits
+		if lim.MaxParticipants > 0 && q.TenantParticipants(tenant.ID) >= lim.MaxParticipants {
+			s.sendError("participant limit reached")
+			return
+		}
+		if tenant.AutoCreateRooms && !s.h.rooms.HasRoom(roomID) && lim.MaxRooms > 0 && q.TenantRooms(tenant.ID) >= lim.MaxRooms {
+			s.sendError("room limit reached")
+			return
+		}
+		opts.MaxParticipants = lim.MaxRoomSize
+	}
 
 	pub, err := peer.New(s.h.api, s.h.iceCfg, logger, participantID+"/pub")
 	if err != nil {
@@ -291,14 +353,18 @@ func (s *session) join(tok string) {
 		}
 	}
 	participant := room.NewParticipant(participantID, pub, sub, notify)
+	participant.SetGrants(grants)
 	join := s.h.rooms.JoinExisting
 	if tenant.AutoCreateRooms {
-		join = s.h.rooms.Join
+		join = func(id string, p *room.Participant) (*room.Room, error) { return s.h.rooms.JoinOrCreate(id, p, opts) }
 	}
 	r, err := join(roomID, participant)
 	if err != nil {
 		_ = pub.Close()
 		_ = sub.Close()
+		if s.h.routing != nil {
+			s.h.routing.Release(roomID)
+		}
 		switch {
 		case errors.Is(err, room.ErrDuplicateParticipant):
 			s.sendError("participant already in room")
@@ -314,7 +380,6 @@ func (s *session) join(tok string) {
 
 	s.mu.Lock()
 	s.joinLogger = logger
-	s.grants = grants
 	s.roomID, s.participantID, s.participant = roomID, participantID, participant
 	s.publisher, s.subscriber = pub, sub
 	s.mu.Unlock()
@@ -323,20 +388,12 @@ func (s *session) join(tok string) {
 		s.mu.Lock()
 		source := sfu.NormalizeSource(s.trackSources[remote.ID()], remote.Kind())
 		s.mu.Unlock()
-		if !grants.AllowsSource(source) {
-			// Not forwarded. Keep reading and drop the packets, so Pion's
-			// buffers and RTCP keep working; the loop ends when the client
-			// removes the track or the peer closes.
-			logger.Info("track rejected by grants", "source", source)
+		// A source the grants do not allow is still published, but the router
+		// keeps it paused, so the server API can allow it later without
+		// renegotiation.
+		if !participant.Grants().AllowsSource(source) {
+			logger.Info("track not allowed by grants, paused", "source", source)
 			s.sendError("not allowed to publish " + source)
-			go func() {
-				for {
-					if _, _, err := remote.ReadRTP(); err != nil {
-						return
-					}
-				}
-			}()
-			return
 		}
 		if err := r.Router().Publish(participantID, source, pub, remote); err != nil {
 			logger.Warn("publish failed", "err", err)
@@ -346,9 +403,8 @@ func (s *session) join(tok string) {
 	// goroutine: OnClose may be called from inside session.close itself.
 	pub.OnClose(func() { go s.close() })
 	sub.OnClose(func() { go s.close() })
-	if grants.Subscribe {
-		r.Router().AddSubscriber(participantID, sub)
-	}
+	// The room adds the subscriber during Join, under its lock, so a
+	// permission change can never race with it.
 
 	// close may have run during the steps above. It reads the participant
 	// fields after marking the session closed, and we check the mark after all
@@ -376,11 +432,20 @@ func (s *session) failJoin(logger *slog.Logger, err error) {
 // send queues msg for writeLoop. It never blocks: if the queue is full, the
 // client is too slow and the session ends.
 func (s *session) send(msg Message) {
+	data, err := json.Marshal(msg)
+	if err != nil {
+		return
+	}
+	s.sendRaw(data)
+}
+
+// sendRaw queues an encoded message, like send.
+func (s *session) sendRaw(data []byte) {
 	if s.closed.Load() {
 		return
 	}
 	select {
-	case s.out <- msg:
+	case s.out <- data:
 	default:
 		s.logger.Warn("signaling client too slow, disconnecting")
 		go s.close()
@@ -414,9 +479,9 @@ func (s *session) writeLoop() {
 	}
 }
 
-func (s *session) write(msg Message) bool {
+func (s *session) write(data []byte) bool {
 	_ = s.conn.SetWriteDeadline(time.Now().Add(writeTimeout))
-	if err := s.conn.WriteJSON(msg); err != nil {
+	if err := s.conn.WriteMessage(websocket.TextMessage, data); err != nil {
 		s.logger.Debug("signaling write failed", "err", err)
 		return false
 	}
@@ -463,6 +528,11 @@ func (s *session) close() {
 	if participant != nil {
 		s.h.rooms.LeaveParticipant(roomID, participant)
 	}
+	if up := s.upstreamConn(); up != nil {
+		_ = up.WriteControl(websocket.CloseMessage,
+			websocket.FormatCloseMessage(websocket.CloseNormalClosure, ""), time.Now().Add(time.Second))
+		_ = up.Close()
+	}
 
 	// Wait for writeLoop to flush. close never runs on the writeLoop goroutine
 	// (it calls close with go), so this cannot wait for itself.
@@ -488,8 +558,11 @@ func eventMessage(roomID, participantID string, e room.Event) Message {
 		return Message{Type: TypeParticipantLeft, Participant: e.Participant}
 	case room.EventRemoved:
 		return Message{Type: TypeRemoved, Message: e.Reason}
+	case room.EventGrants:
+		g := e.Grants
+		return Message{Type: TypePermissions, Grants: &g}
 	default: // room.EventMuted
 		muted := e.Muted
-		return Message{Type: TypeMute, Participant: e.Participant, Source: e.Source, Muted: &muted}
+		return Message{Type: TypeMute, Participant: e.Participant, Source: e.Source, Muted: &muted, ByServer: e.ByServer}
 	}
 }

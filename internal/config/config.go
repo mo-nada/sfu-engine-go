@@ -5,10 +5,13 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"os"
 	"strings"
 	"time"
 
 	"github.com/mo-nada/sfu-engine/internal/auth"
+	"github.com/mo-nada/sfu-engine/internal/cluster"
+	"github.com/mo-nada/sfu-engine/internal/store"
 )
 
 // Config holds all settings needed to run the SFU server.
@@ -30,6 +33,27 @@ type Config struct {
 	// Dev adds a development tenant with a random secret and enables
 	// GET /dev/token, which gives a join token to anyone. Never use in production.
 	Dev bool
+
+	// DatabaseURL is the PostgreSQL URL for tenants, keys and usage. Empty
+	// keeps them in memory (lost on restart, one node only).
+	DatabaseURL string
+	// RedisURL is the Redis or Valkey URL shared by all nodes. Empty means a
+	// single node.
+	RedisURL string
+	// AdminSecret enables the operator admin API (/admin/v1); at least 32 bytes.
+	AdminSecret string
+	// NodeID names this node in the cluster (default: host name plus random).
+	NodeID string
+	// NodeURL is the base URL other nodes use to reach this node, for
+	// example http://10.0.0.5:8080 (default: http://127.0.0.1:<port>).
+	NodeURL string
+	// DrainTimeout is how long shutdown waits for rooms to empty while the
+	// node takes no new rooms. 0 shuts down at once.
+	DrainTimeout time.Duration
+
+	// For embedding and tests: ready-made stores instead of URLs.
+	Store        store.Store
+	ClusterStore cluster.Store
 }
 
 // Default returns a Config with sensible defaults.
@@ -56,6 +80,12 @@ func Load(args []string) (Config, error) {
 	fs.DurationVar(&cfg.ShutdownTimeout, "shutdown-timeout", cfg.ShutdownTimeout, "maximum time for graceful shutdown")
 	fs.StringVar(&cfg.TenantsFile, "tenants", "", "JSON file with tenants and their API keys and secrets")
 	fs.BoolVar(&cfg.Dev, "dev", false, "development mode: dev tenant and open /dev/token endpoint (never in production)")
+	fs.StringVar(&cfg.DatabaseURL, "database-url", os.Getenv("SFU_DATABASE_URL"), "PostgreSQL URL for tenants, keys and usage (env SFU_DATABASE_URL); empty keeps them in memory")
+	fs.StringVar(&cfg.RedisURL, "redis-url", os.Getenv("SFU_REDIS_URL"), "Redis/Valkey URL shared by all nodes (env SFU_REDIS_URL); empty means one node")
+	fs.StringVar(&cfg.AdminSecret, "admin-secret", os.Getenv("SFU_ADMIN_SECRET"), "enables the admin API (prefer env SFU_ADMIN_SECRET; at least 32 bytes)")
+	fs.StringVar(&cfg.NodeID, "node-id", os.Getenv("SFU_NODE_ID"), "node name in the cluster (env SFU_NODE_ID)")
+	fs.StringVar(&cfg.NodeURL, "node-url", os.Getenv("SFU_NODE_URL"), "URL other nodes use to reach this node (env SFU_NODE_URL)")
+	fs.DurationVar(&cfg.DrainTimeout, "drain-timeout", 0, "on shutdown, wait this long for rooms to empty (0: stop at once)")
 
 	if err := fs.Parse(args); err != nil {
 		return Config{}, err
@@ -89,8 +119,17 @@ func (c Config) Validate() error {
 			errs = append(errs, fmt.Errorf("invalid STUN URL %q: must start with stun: or stuns:", u))
 		}
 	}
-	if c.TenantsFile == "" && len(c.Tenants) == 0 && !c.Dev {
-		errs = append(errs, errors.New("no tenants: pass -tenants FILE, or -dev for local development"))
+	if c.TenantsFile == "" && len(c.Tenants) == 0 && !c.Dev && c.DatabaseURL == "" && c.Store == nil && c.AdminSecret == "" {
+		errs = append(errs, errors.New("no tenants: pass -tenants FILE, -database-url, -admin-secret, or -dev for local development"))
+	}
+	if c.AdminSecret != "" && len(c.AdminSecret) < 32 {
+		errs = append(errs, errors.New("admin secret must be at least 32 bytes"))
+	}
+	if c.NodeURL != "" && !strings.HasPrefix(c.NodeURL, "http://") && !strings.HasPrefix(c.NodeURL, "https://") {
+		errs = append(errs, errors.New("node url must start with http:// or https://"))
+	}
+	if c.DrainTimeout < 0 {
+		errs = append(errs, errors.New("drain timeout must not be negative"))
 	}
 	if c.ShutdownTimeout <= 0 {
 		errs = append(errs, errors.New("shutdown timeout must be positive"))

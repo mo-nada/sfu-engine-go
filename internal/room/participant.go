@@ -25,10 +25,6 @@ type Participant struct {
 	notify     Notifier
 	joinedAt   time.Time
 
-	// applyMu serializes permission and server-mute changes, which update
-	// both the participant (under the Manager lock) and the router (after it).
-	applyMu sync.Mutex
-
 	mu          sync.Mutex
 	muted       map[string]bool // source -> muted (as everyone sees it)
 	serverMuted map[string]bool // source -> muted by the server

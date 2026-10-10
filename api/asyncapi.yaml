@@ -1,7 +1,7 @@
 asyncapi: 3.0.0
 info:
   title: SFU Engine Signaling API
-  version: 0.4.0
+  version: 0.5.0
   description: |
     WebSocket signaling protocol of the Go WebRTC SFU engine.
 
@@ -21,6 +21,10 @@ info:
     "not allowed to publish". A track whose source is not in `sources` is not
     forwarded, and the client gets "not allowed to publish <source>". Without
     `subscribe`, the client receives no media (it still gets roster events).
+    The server API can change permissions at any time (`permissions` message)
+    and mute a source from the server (`mute` with `by_server`). These server
+    changes stay with the identity while the room exists: reconnecting with
+    the same token does not undo them.
 
     **Flow.**
     1. Send `join` as the first message. The server replies with `joined`,
@@ -65,6 +69,7 @@ channels:
       muteEvent: { $ref: '#/components/messages/muteEvent' }
       leave: { $ref: '#/components/messages/leave' }
       removed: { $ref: '#/components/messages/removed' }
+      permissions: { $ref: '#/components/messages/permissions' }
       error: { $ref: '#/components/messages/error' }
 operations:
   sendToServer:
@@ -91,6 +96,7 @@ operations:
       - $ref: '#/channels/signaling/messages/serverCandidate'
       - $ref: '#/channels/signaling/messages/muteEvent'
       - $ref: '#/channels/signaling/messages/removed'
+      - $ref: '#/channels/signaling/messages/permissions'
       - $ref: '#/channels/signaling/messages/error'
 components:
   schemas:
@@ -125,7 +131,7 @@ components:
     join:
       name: join
       title: Join a room (client → server)
-      summary: Must be the first message. The token names the room, the participant (unique in the room) and the permissions. Errors are "invalid token", "participant already in room" and "room is full".
+      summary: Must be the first message. The token names the room, the participant (unique in the room) and the permissions. Errors are "invalid token", "room not found" (the room must be created through the server API first, unless the tenant has auto_create_rooms), "participant already in room" and "room is full".
       payload:
         type: object
         required: [type, token]
@@ -256,7 +262,8 @@ components:
         - payload: { type: mute, source: microphone, muted: true }
     muteEvent:
       name: mute
-      title: Another participant's mute change (server → client)
+      title: A mute change (server → client)
+      summary: Another participant muted or unmuted a source, or the server did (by_server). A server mute is also sent to the muted participant itself, which then cannot unmute (error "muted by the server").
       payload:
         type: object
         required: [type, participant, source, muted]
@@ -265,6 +272,7 @@ components:
           participant: { $ref: '#/components/schemas/id' }
           source: { $ref: '#/components/schemas/source' }
           muted: { type: boolean }
+          by_server: { type: boolean, description: 'True when the server API muted it.' }
       examples:
         - payload: { type: mute, participant: alice, source: camera, muted: true }
     leave:
@@ -276,6 +284,23 @@ components:
         required: [type]
         properties:
           type: { const: leave }
+    permissions:
+      name: permissions
+      title: Your permissions changed (server → client)
+      summary: Sent when the server API changes this participant's grants. Sources no longer allowed stop being forwarded; without subscribe, no media is received.
+      payload:
+        type: object
+        required: [type, grants]
+        properties:
+          type: { const: permissions }
+          grants:
+            type: object
+            properties:
+              publish: { type: boolean }
+              subscribe: { type: boolean }
+              sources: { type: array, items: { $ref: '#/components/schemas/source' } }
+      examples:
+        - payload: { type: permissions, grants: { publish: true, subscribe: true, sources: [camera, microphone] } }
     removed:
       name: removed
       title: You were removed (server → client)

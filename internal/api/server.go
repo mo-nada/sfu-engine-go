@@ -10,9 +10,11 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"regexp"
+	"sort"
 	"strings"
 	"time"
 
@@ -42,6 +44,8 @@ type Rooms interface {
 	Details(roomID string) ([]room.ParticipantDetail, error)
 	Delete(roomID, reason string) error
 	Remove(roomID, participantID, reason string) error
+	ServerMute(roomID, participantID, source string, muted bool) error
+	UpdateGrants(roomID, participantID string, change func(token.Grants) (token.Grants, error)) (token.Grants, error)
 }
 
 // LocalRooms adapts a room.Manager to Rooms.
@@ -58,7 +62,12 @@ type Server struct {
 	tenants *auth.Tenants
 	rooms   Rooms
 	logger  *slog.Logger
+	cluster Cluster // nil: single node
+	quota   Quota   // nil: no tenant limits
 }
+
+// SetPlatform enables multi-node routing and tenant limits. Call it before serving.
+func (s *Server) SetPlatform(c Cluster, q Quota) { s.cluster, s.quota = c, q }
 
 // NewServer creates the API server.
 func NewServer(tenants *auth.Tenants, rooms Rooms, logger *slog.Logger) *Server {
@@ -70,10 +79,12 @@ func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /v1/rooms", s.createRoom)
 	mux.HandleFunc("GET /v1/rooms", s.listRooms)
-	mux.HandleFunc("GET /v1/rooms/{room}", s.getRoom)
-	mux.HandleFunc("DELETE /v1/rooms/{room}", s.deleteRoom)
-	mux.HandleFunc("GET /v1/rooms/{room}/participants", s.listParticipants)
-	mux.HandleFunc("DELETE /v1/rooms/{room}/participants/{participant}", s.removeParticipant)
+	mux.HandleFunc("GET /v1/rooms/{room}", s.owned(s.getRoom))
+	mux.HandleFunc("DELETE /v1/rooms/{room}", s.owned(s.deleteRoom))
+	mux.HandleFunc("GET /v1/rooms/{room}/participants", s.owned(s.listParticipants))
+	mux.HandleFunc("DELETE /v1/rooms/{room}/participants/{participant}", s.owned(s.removeParticipant))
+	mux.HandleFunc("PATCH /v1/rooms/{room}/participants/{participant}", s.owned(s.updateParticipant))
+	mux.HandleFunc("POST /v1/rooms/{room}/participants/{participant}/mute", s.owned(s.muteParticipant))
 	mux.HandleFunc("POST /v1/tokens", s.createToken)
 	mux.HandleFunc("/v1/", func(w http.ResponseWriter, _ *http.Request) {
 		writeError(w, http.StatusNotFound, "not_found", "no such endpoint")
@@ -131,6 +142,42 @@ type participantJSON struct {
 	JoinedAt time.Time       `json:"joined_at"`
 	Sources  []string        `json:"sources"`
 	Muted    map[string]bool `json:"muted"`
+	Grants   grantsJSON      `json:"grants"`
+}
+
+type grantsJSON struct {
+	Publish   bool     `json:"publish"`
+	Subscribe bool     `json:"subscribe"`
+	Sources   []string `json:"sources"`
+}
+
+// grantsPatch is the request form of grants: missing fields keep their value.
+type grantsPatch struct {
+	Publish   *bool     `json:"publish"`
+	Subscribe *bool     `json:"subscribe"`
+	Sources   *[]string `json:"sources"`
+}
+
+// apply returns g with the patch applied, or an error message.
+func (p *grantsPatch) apply(g token.Grants) (token.Grants, string) {
+	if p == nil {
+		return g, ""
+	}
+	if p.Publish != nil {
+		g.Publish = *p.Publish
+	}
+	if p.Subscribe != nil {
+		g.Subscribe = *p.Subscribe
+	}
+	if p.Sources != nil {
+		for _, src := range *p.Sources {
+			if !sfu.ValidSource(src) {
+				return g, "unknown source " + src
+			}
+		}
+		g.Sources = *p.Sources
+	}
+	return g, ""
 }
 
 func toRoomJSON(s room.RoomSummary) roomJSON {
@@ -147,7 +194,11 @@ func toRoomJSON(s room.RoomSummary) roomJSON {
 func toParticipantsJSON(ds []room.ParticipantDetail) []participantJSON {
 	out := make([]participantJSON, 0, len(ds))
 	for _, d := range ds {
-		p := participantJSON{Identity: d.ID, JoinedAt: d.JoinedAt.UTC(), Sources: d.Sources, Muted: d.Muted}
+		p := participantJSON{Identity: d.ID, JoinedAt: d.JoinedAt.UTC(), Sources: d.Sources, Muted: d.Muted,
+			Grants: grantsJSON{Publish: d.Grants.Publish, Subscribe: d.Grants.Subscribe, Sources: d.Grants.Sources}}
+		if p.Grants.Sources == nil {
+			p.Grants.Sources = []string{}
+		}
 		if p.Sources == nil {
 			p.Sources = []string{}
 		}
@@ -186,8 +237,56 @@ func (s *Server) createRoom(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	key := tenantOf(r).ID + "/" + req.Name
+	tenant := tenantOf(r)
+	if max := tenant.Limits.MaxRoomSize; max > 0 {
+		if opts.MaxParticipants == 0 {
+			opts.MaxParticipants = max
+		} else if opts.MaxParticipants > max {
+			writeError(w, http.StatusBadRequest, "invalid", fmt.Sprintf("max_participants is above your plan's room size (%d)", max))
+			return
+		}
+	}
+	if max := tenant.Limits.MaxRooms; max > 0 && s.quota != nil && s.quota.TenantRooms(tenant.ID) >= max {
+		writeError(w, http.StatusForbidden, "limit_reached", fmt.Sprintf("your plan allows %d rooms at the same time", max))
+		return
+	}
+
+	key := tenant.ID + "/" + req.Name
+	if s.cluster != nil {
+		// Place the room: on a less loaded node (forwarded there), or here.
+		if !routed(r) {
+			if id, _, err := s.cluster.Owner(r.Context(), key); err != nil {
+				s.unavailable(w, err)
+				return
+			} else if id != "" && id != s.cluster.ID() {
+				writeError(w, http.StatusConflict, "conflict", "room already exists")
+				return
+			}
+			n, err := s.cluster.PickNode()
+			if err != nil {
+				s.unavailable(w, err)
+				return
+			}
+			if n.ID != s.cluster.ID() {
+				body, _ := json.Marshal(req)
+				s.proxy(w, r, n.URL, body)
+				return
+			}
+		}
+		id, _, err := s.cluster.ClaimSelf(r.Context(), key)
+		if err != nil {
+			s.unavailable(w, err)
+			return
+		}
+		if id != s.cluster.ID() {
+			writeError(w, http.StatusConflict, "conflict", "room already exists")
+			return
+		}
+	}
 	if err := s.rooms.Create(key, opts); err != nil {
+		if s.cluster != nil && !errors.Is(err, room.ErrRoomExists) {
+			s.cluster.Release(key)
+		}
 		s.roomError(w, err)
 		return
 	}
@@ -204,6 +303,10 @@ func (s *Server) listRooms(w http.ResponseWriter, r *http.Request) {
 	out := make([]roomJSON, 0, len(list))
 	for _, sum := range list {
 		out = append(out, toRoomJSON(sum))
+	}
+	if s.cluster != nil && !routed(r) {
+		out = append(out, s.remoteRooms(r)...)
+		sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"rooms": out})
 }
@@ -256,13 +359,8 @@ func (s *Server) listParticipants(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) removeParticipant(w http.ResponseWriter, r *http.Request) {
-	key, ok := roomKey(w, r)
+	key, id, ok := participantKey(w, r)
 	if !ok {
-		return
-	}
-	id := r.PathValue("participant")
-	if !validID.MatchString(id) {
-		writeError(w, http.StatusBadRequest, "invalid", "participant must be 1-64 letters, digits, '-' or '_'")
 		return
 	}
 	if err := s.rooms.Remove(key, id, "removed by the server"); err != nil {
@@ -272,18 +370,99 @@ func (s *Server) removeParticipant(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
+func (s *Server) muteParticipant(w http.ResponseWriter, r *http.Request) {
+	key, id, ok := participantKey(w, r)
+	if !ok {
+		return
+	}
+	var req struct {
+		Source string `json:"source"`
+		Muted  *bool  `json:"muted"`
+	}
+	if !readJSON(w, r, &req) {
+		return
+	}
+	if !sfu.ValidSource(req.Source) || req.Muted == nil {
+		writeError(w, http.StatusBadRequest, "invalid", "need source (camera, microphone, screen, screen-audio) and muted")
+		return
+	}
+	if err := s.rooms.ServerMute(key, id, req.Source, *req.Muted); err != nil {
+		s.roomError(w, err)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (s *Server) updateParticipant(w http.ResponseWriter, r *http.Request) {
+	key, id, ok := participantKey(w, r)
+	if !ok {
+		return
+	}
+	var req struct {
+		Grants *grantsPatch `json:"grants"`
+	}
+	if !readJSON(w, r, &req) {
+		return
+	}
+	// The patch is applied to the current grants inside UpdateGrants, as one
+	// step, so two concurrent PATCH requests cannot undo each other.
+	_, err := s.rooms.UpdateGrants(key, id, func(cur token.Grants) (token.Grants, error) {
+		g, msg := req.Grants.apply(cur)
+		if msg != "" {
+			return cur, errInvalidPatch(msg)
+		}
+		return g, nil
+	})
+	var invalid errInvalidPatch
+	switch {
+	case errors.As(err, &invalid):
+		writeError(w, http.StatusBadRequest, "invalid", string(invalid))
+		return
+	case err != nil:
+		s.roomError(w, err)
+		return
+	}
+	details, err := s.rooms.Details(key)
+	if err != nil {
+		s.roomError(w, err)
+		return
+	}
+	for _, d := range details {
+		if d.ID == id {
+			writeJSON(w, http.StatusOK, toParticipantsJSON([]room.ParticipantDetail{d})[0])
+			return
+		}
+	}
+	writeError(w, http.StatusNotFound, "not_found", "participant not found") // left meanwhile
+}
+
+// errInvalidPatch is a validation error from a grants patch.
+type errInvalidPatch string
+
+func (e errInvalidPatch) Error() string { return string(e) }
+
+// participantKey returns the room key and the {participant} path value.
+func participantKey(w http.ResponseWriter, r *http.Request) (string, string, bool) {
+	key, ok := roomKey(w, r)
+	if !ok {
+		return "", "", false
+	}
+	id := r.PathValue("participant")
+	if !validID.MatchString(id) {
+		writeError(w, http.StatusBadRequest, "invalid", "participant must be 1-64 letters, digits, '-' or '_'")
+		return "", "", false
+	}
+	return key, id, true
+}
+
 // ---------- tokens ----------
 
 func (s *Server) createToken(w http.ResponseWriter, r *http.Request) {
 	var req struct {
-		Room       string `json:"room"`
-		Identity   string `json:"identity"`
-		TTLSeconds int    `json:"ttl_seconds"`
-		Grants     *struct {
-			Publish   *bool    `json:"publish"`
-			Subscribe *bool    `json:"subscribe"`
-			Sources   []string `json:"sources"`
-		} `json:"grants"`
+		Room       string       `json:"room"`
+		Identity   string       `json:"identity"`
+		TTLSeconds int          `json:"ttl_seconds"`
+		Grants     *grantsPatch `json:"grants"`
 	}
 	if !readJSON(w, r, &req) {
 		return
@@ -299,20 +478,10 @@ func (s *Server) createToken(w http.ResponseWriter, r *http.Request) {
 	}
 	tenant := tenantOf(r)
 	c := token.New(tenant.APIKey, req.Identity, req.Room, ttl)
-	if g := req.Grants; g != nil {
-		if g.Publish != nil {
-			c.Grants.Publish = *g.Publish
-		}
-		if g.Subscribe != nil {
-			c.Grants.Subscribe = *g.Subscribe
-		}
-		for _, src := range g.Sources {
-			if !sfu.ValidSource(src) {
-				writeError(w, http.StatusBadRequest, "invalid", "unknown source "+src)
-				return
-			}
-		}
-		c.Grants.Sources = g.Sources
+	var msg string
+	if c.Grants, msg = req.Grants.apply(c.Grants); msg != "" {
+		writeError(w, http.StatusBadRequest, "invalid", msg)
+		return
 	}
 	tok, err := token.Sign(tenant.Secret, c)
 	if err != nil {

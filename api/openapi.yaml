@@ -1,7 +1,7 @@
 openapi: 3.1.0
 info:
   title: SFU Engine HTTP API
-  version: 0.4.0
+  version: 0.5.0
   summary: HTTP endpoints of the Go WebRTC SFU engine.
   description: |
     The SFU has a small HTTP surface. Almost all interaction happens over the
@@ -51,9 +51,10 @@ paths:
       summary: Create a room
       description: |
         Creates a room with options. It stays open while empty for
-        `empty_timeout_seconds` (default 300), then it is removed. Rooms are
-        also created automatically when someone joins a room that does not
-        exist; those have no limits and are removed when the last person leaves.
+        `empty_timeout_seconds` (default 300), then it is removed. A join only
+        works for a room created here, unless the tenant has
+        `auto_create_rooms` enabled: then a join creates a missing room, with no
+        limits, which is removed when the last person leaves.
       security: [{ apiToken: [] }]
       requestBody:
         required: true
@@ -150,6 +151,33 @@ paths:
         in: path
         required: true
         schema: { $ref: '#/components/schemas/id' }
+    patch:
+      tags: [participants]
+      operationId: updateParticipant
+      summary: Change a participant's permissions live
+      description: |
+        Fields that are present replace the current value; missing fields keep
+        it. Sources it may no longer publish stop being forwarded (and resume
+        if allowed again, without renegotiation). Without `subscribe`, it stops
+        receiving media. The participant receives a `permissions` message. The
+        new permissions stay with the identity while the room exists and
+        replace the token's grants if it reconnects.
+      security: [{ apiToken: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              properties:
+                grants: { $ref: '#/components/schemas/grants' }
+            example: { grants: { sources: [camera, microphone] } }
+      responses:
+        "200": { description: The participant after the change., content: { application/json: { schema: { $ref: '#/components/schemas/participant' } } } }
+        "400": { $ref: '#/components/responses/invalid' }
+        "401": { $ref: '#/components/responses/unauthorized' }
+        "404": { $ref: '#/components/responses/notFound' }
     delete:
       tags: [participants]
       operationId: removeParticipant
@@ -158,6 +186,40 @@ paths:
       security: [{ apiToken: [] }]
       responses:
         "204": { description: Removed. }
+        "400": { $ref: '#/components/responses/invalid' }
+        "401": { $ref: '#/components/responses/unauthorized' }
+        "404": { $ref: '#/components/responses/notFound' }
+  /v1/rooms/{room}/participants/{identity}/mute:
+    parameters:
+      - $ref: '#/components/parameters/room'
+      - name: identity
+        in: path
+        required: true
+        schema: { $ref: '#/components/schemas/id' }
+    post:
+      tags: [participants]
+      operationId: muteParticipant
+      summary: Mute or unmute a participant's source from the server
+      description: |
+        The source stops (or resumes) being forwarded to everyone. All
+        participants, including this one, receive `mute` with `by_server: true`.
+        The participant cannot unmute a server mute itself, and reconnecting
+        does not undo it: it stays with the identity while the room exists.
+      security: [{ apiToken: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [source, muted]
+              additionalProperties: false
+              properties:
+                source: { type: string, enum: [camera, microphone, screen, screen-audio] }
+                muted: { type: boolean }
+            example: { source: microphone, muted: true }
+      responses:
+        "204": { description: Done. }
         "400": { $ref: '#/components/responses/invalid' }
         "401": { $ref: '#/components/responses/unauthorized' }
         "404": { $ref: '#/components/responses/notFound' }
@@ -352,7 +414,7 @@ components:
         empty_timeout_seconds: { type: integer, description: '0 for rooms created by a join (removed when empty).' }
     participant:
       type: object
-      required: [identity, joined_at, sources, muted]
+      required: [identity, joined_at, sources, muted, grants]
       properties:
         identity: { $ref: '#/components/schemas/id' }
         joined_at: { type: string, format: date-time }
@@ -364,6 +426,7 @@ components:
           type: object
           additionalProperties: { type: boolean }
           example: { microphone: true }
+        grants: { $ref: '#/components/schemas/grants' }
     grants:
       type: object
       additionalProperties: false
