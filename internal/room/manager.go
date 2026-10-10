@@ -8,6 +8,9 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/mo-nada/sfu-engine/internal/sfu"
+	"github.com/mo-nada/sfu-engine/pkg/token"
 )
 
 var (
@@ -23,6 +26,9 @@ var (
 	ErrRoomNotFound = errors.New("room not found")
 	// ErrRoomFull is returned by Join when the room has MaxParticipants.
 	ErrRoomFull = errors.New("room is full")
+	// ErrServerMuted is returned by SetMuted when the client tries to unmute
+	// a source the server muted.
+	ErrServerMuted = errors.New("muted by the server")
 )
 
 // Manager owns all rooms. Join and Leave are serialized by one lock, so a
@@ -42,6 +48,15 @@ func NewManager(logger *slog.Logger) *Manager {
 
 // Join adds p to the room, creating the room if needed.
 func (m *Manager) Join(roomID string, p *Participant) (*Room, error) {
+	return m.join(roomID, p, true)
+}
+
+// JoinExisting adds p to the room only if it exists (ErrRoomNotFound otherwise).
+func (m *Manager) JoinExisting(roomID string, p *Participant) (*Room, error) {
+	return m.join(roomID, p, false)
+}
+
+func (m *Manager) join(roomID string, p *Participant, create bool) (*Room, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -50,6 +65,9 @@ func (m *Manager) Join(roomID string, p *Participant) (*Room, error) {
 	}
 
 	r, ok := m.rooms[roomID]
+	if !ok && !create {
+		return nil, ErrRoomNotFound
+	}
 	if !ok {
 		r = newRoom(roomID, Options{}, false, m.logger)
 		m.rooms[roomID] = r
@@ -68,6 +86,13 @@ func (m *Manager) Join(roomID string, p *Participant) (*Room, error) {
 	if r.emptyTimer != nil {
 		r.emptyTimer.Stop()
 		r.emptyTimer = nil
+	}
+	// Set this publisher's forwarding rules from scratch, so nothing is left
+	// over from an earlier session with the same ID.
+	g := p.Grants()
+	for _, src := range sfu.Sources {
+		r.router.SetBlocked(p.ID(), src, sfu.BlockNotAllowed, !g.AllowsSource(src))
+		r.router.SetBlocked(p.ID(), src, sfu.BlockServerMute, false)
 	}
 
 	// Notify under the lock, so the roster and later events arrive in order.
@@ -96,6 +121,12 @@ func (m *Manager) SetMuted(roomID, participantID, source string, muted bool) err
 	p, ok := r.Participant(participantID)
 	if !ok {
 		return ErrNotInRoom
+	}
+	p.mu.Lock()
+	byServer := p.serverMuted[source]
+	p.mu.Unlock()
+	if byServer && !muted {
+		return ErrServerMuted
 	}
 	p.setMuted(source, muted)
 	for _, o := range r.othersThan(participantID) {
@@ -245,6 +276,88 @@ func (m *Manager) Delete(roomID, reason string) error {
 	return nil
 }
 
+// ServerMute mutes or unmutes participantID's source from the server: its
+// media stops (or resumes) for everyone, everyone including the participant
+// is told, and the participant cannot unmute it itself.
+func (m *Manager) ServerMute(roomID, participantID, source string, muted bool) error {
+	r, p, err := m.lookup(roomID, participantID)
+	if err != nil {
+		return err
+	}
+	p.applyMu.Lock()
+	defer p.applyMu.Unlock()
+
+	m.mu.Lock()
+	if cur, ok := r.Participant(participantID); !ok || cur != p {
+		m.mu.Unlock()
+		return ErrNotInRoom
+	}
+	p.mu.Lock()
+	p.serverMuted[source] = muted
+	p.muted[source] = muted
+	p.mu.Unlock()
+	for _, o := range r.Participants() { // including the participant itself
+		o.send(Event{Kind: EventMuted, Participant: participantID, Source: source, Muted: muted, ByServer: true})
+	}
+	m.mu.Unlock()
+
+	r.router.SetBlocked(participantID, source, sfu.BlockServerMute, muted)
+	m.logger.Info("participant muted by the server", "room_id", roomID, "participant_id", participantID, "source", source, "muted", muted)
+	return nil
+}
+
+// UpdateGrants replaces participantID's permissions while it is in the room:
+// sources it may no longer publish stop being forwarded, and its incoming
+// media starts or stops with the subscribe permission. It is told the new
+// permissions.
+func (m *Manager) UpdateGrants(roomID, participantID string, g token.Grants) error {
+	r, p, err := m.lookup(roomID, participantID)
+	if err != nil {
+		return err
+	}
+	p.applyMu.Lock()
+	defer p.applyMu.Unlock()
+
+	m.mu.Lock()
+	if cur, ok := r.Participant(participantID); !ok || cur != p {
+		m.mu.Unlock()
+		return ErrNotInRoom
+	}
+	old := p.Grants()
+	p.SetGrants(g)
+	p.send(Event{Kind: EventGrants, Grants: g})
+	m.mu.Unlock()
+
+	for _, src := range sfu.Sources {
+		r.router.SetBlocked(participantID, src, sfu.BlockNotAllowed, !g.AllowsSource(src))
+	}
+	if p.subscriber != nil {
+		switch {
+		case g.Subscribe && !old.Subscribe:
+			r.router.AddSubscriber(participantID, p.subscriber)
+		case !g.Subscribe && old.Subscribe:
+			r.router.Unsubscribe(participantID, p.subscriber)
+		}
+	}
+	m.logger.Info("participant permissions changed", "room_id", roomID, "participant_id", participantID,
+		"publish", g.Publish, "subscribe", g.Subscribe, "sources", g.Sources)
+	return nil
+}
+
+func (m *Manager) lookup(roomID, participantID string) (*Room, *Participant, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	r, ok := m.rooms[roomID]
+	if !ok {
+		return nil, nil, ErrRoomNotFound
+	}
+	p, ok := r.Participant(participantID)
+	if !ok {
+		return nil, nil, ErrNotInRoom
+	}
+	return r, p, nil
+}
+
 // RoomSummary describes a room.
 type RoomSummary struct {
 	ID              string
@@ -260,6 +373,7 @@ type ParticipantDetail struct {
 	JoinedAt time.Time
 	Muted    map[string]bool
 	Sources  []string // sources being published, sorted
+	Grants   token.Grants
 }
 
 // List returns the rooms whose ID starts with prefix, sorted by ID.
@@ -300,12 +414,14 @@ func (m *Manager) Details(roomID string) ([]ParticipantDetail, error) {
 	for _, p := range parts {
 		p.mu.Lock()
 		muted := maps.Clone(p.muted)
+		grants := p.grants
 		p.mu.Unlock()
 		out = append(out, ParticipantDetail{
 			ID:       p.ID(),
 			JoinedAt: p.joinedAt,
 			Muted:    muted,
 			Sources:  r.router.PublishedSources(p.ID()),
+			Grants:   grants,
 		})
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })

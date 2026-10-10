@@ -1,5 +1,7 @@
 package room
 
+import "github.com/mo-nada/sfu-engine/pkg/token"
+
 // Event kinds delivered to participants through their notifier.
 const (
 	// EventRoster is sent once to a participant when it joins. Roster lists
@@ -11,6 +13,9 @@ const (
 	EventLeft = "left"
 	// EventMuted is sent to the others when Participant mutes or unmutes Source.
 	EventMuted = "muted"
+	// EventGrants is sent to a participant whose permissions the server
+	// changed. Grants holds the new permissions.
+	EventGrants = "grants"
 	// EventRemoved is sent to a participant that the server removes (kicked,
 	// or its room closed). Reason says why. The participant is already out
 	// of the room when it arrives.
@@ -23,6 +28,8 @@ type Event struct {
 	Participant string
 	Source      string
 	Muted       bool
+	ByServer    bool // for EventMuted: the server muted it, the client cannot unmute
+	Grants      token.Grants
 	Reason      string
 	Roster      []ParticipantInfo
 }

@@ -49,7 +49,7 @@ func New(opts ...Option) (*Engine, error) {
 	cfg.TenantsFile = o.tenantsFile
 	cfg.Dev = o.dev
 	for _, t := range o.tenants {
-		cfg.Tenants = append(cfg.Tenants, auth.Tenant{ID: t.ID, APIKey: t.APIKey, Secret: t.Secret})
+		cfg.Tenants = append(cfg.Tenants, auth.Tenant{ID: t.ID, APIKey: t.APIKey, Secret: t.Secret, AutoCreateRooms: t.AutoCreateRooms})
 	}
 	if err := cfg.Validate(); err != nil {
 		return nil, err

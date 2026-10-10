@@ -26,8 +26,9 @@ func newTestServer(t *testing.T) (*httptest.Server, *room.Manager) {
 	}
 	rooms := room.NewManager(discardLogger())
 	tenants, err := auth.NewTenants([]auth.Tenant{
-		{ID: "acme", APIKey: "acme-key", Secret: acmeSecret},
-		{ID: "globex", APIKey: "globex-key", Secret: globexSecret},
+		{ID: "acme", APIKey: "acme-key", Secret: acmeSecret, AutoCreateRooms: true},
+		{ID: "globex", APIKey: "globex-key", Secret: globexSecret, AutoCreateRooms: true},
+		{ID: "strict", APIKey: "strict-key", Secret: strictSecret},
 	})
 	if err != nil {
 		t.Fatalf("tenants: %v", err)
@@ -89,6 +90,7 @@ func expectError(t *testing.T, conn *websocket.Conn, contains string) {
 const (
 	acmeSecret   = "acme-secret-acme-secret-acme-sec"
 	globexSecret = "globex-secret-globex-secret-glob"
+	strictSecret = "strict-secret-strict-secret-stri"
 )
 
 // acmeToken returns a join token of tenant "acme" with all permissions.
@@ -334,4 +336,25 @@ func TestPublishNotGranted(t *testing.T) {
 	}
 	send(t, conn, Message{Type: TypeOffer, SDP: "v=0"})
 	expectError(t, conn, "not allowed to publish")
+}
+
+// Without auto_create_rooms, a join needs a room created through the API.
+func TestJoinNeedsCreatedRoom(t *testing.T) {
+	srv, rooms := newTestServer(t)
+	tok, _ := token.Sign(strictSecret, token.New("strict-key", "alice", "r1", time.Minute))
+
+	conn := dial(t, srv)
+	send(t, conn, Message{Type: TypeJoin, Token: tok})
+	expectError(t, conn, "room not found")
+	if _, ok := rooms.Room("strict/r1"); ok {
+		t.Fatal("a join created the room")
+	}
+
+	if _, err := rooms.Create("strict/r1", room.Options{}); err != nil {
+		t.Fatal(err)
+	}
+	send(t, conn, Message{Type: TypeJoin, Token: tok})
+	if msg := next(t, conn); msg.Type != TypeJoined {
+		t.Fatalf("got %+v, want joined", msg)
+	}
 }

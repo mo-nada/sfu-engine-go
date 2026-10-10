@@ -25,6 +25,10 @@ type Tenant struct {
 	ID     string `json:"id"`
 	APIKey string `json:"api_key"`
 	Secret string `json:"secret"`
+	// AutoCreateRooms lets a join create a room that does not exist. When
+	// false (the default), rooms must be created through the server API
+	// first, so their limits always apply and a closed room stays closed.
+	AutoCreateRooms bool `json:"auto_create_rooms"`
 }
 
 // Tenants is an immutable set of tenants, safe for concurrent use.
@@ -68,7 +72,8 @@ func NewTenants(list []Tenant) (*Tenants, error) {
 	return t, nil
 }
 
-// LoadTenants reads tenants from a JSON file: {"tenants": [{"id", "api_key", "secret"}]}.
+// LoadTenants reads tenants from a JSON file:
+// {"tenants": [{"id", "api_key", "secret", "auto_create_rooms"}]}.
 func LoadTenants(path string) ([]Tenant, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
@@ -88,7 +93,7 @@ func LoadTenants(path string) ([]Tenant, error) {
 func DevTenant() Tenant {
 	b := make([]byte, 32)
 	_, _ = rand.Read(b) // never fails on supported platforms
-	return Tenant{ID: "dev", APIKey: "devkey", Secret: hex.EncodeToString(b)}
+	return Tenant{ID: "dev", APIKey: "devkey", Secret: hex.EncodeToString(b), AutoCreateRooms: true}
 }
 
 // ByAPIKey returns the tenant with the given API key.

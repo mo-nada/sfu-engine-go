@@ -3,7 +3,8 @@
     {
       "id": "acme",
       "api_key": "acme-key",
-      "secret": "replace-with-at-least-32-random-bytes-0001"
+      "secret": "replace-with-at-least-32-random-bytes-0001",
+      "auto_create_rooms": false
     }
   ]
 }

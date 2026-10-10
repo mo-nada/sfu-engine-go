@@ -291,7 +291,11 @@ func (s *session) join(tok string) {
 		}
 	}
 	participant := room.NewParticipant(participantID, pub, sub, notify)
-	r, err := s.h.rooms.Join(roomID, participant)
+	join := s.h.rooms.JoinExisting
+	if tenant.AutoCreateRooms {
+		join = s.h.rooms.Join
+	}
+	r, err := join(roomID, participant)
 	if err != nil {
 		_ = pub.Close()
 		_ = sub.Close()
@@ -300,6 +304,8 @@ func (s *session) join(tok string) {
 			s.sendError("participant already in room")
 		case errors.Is(err, room.ErrRoomFull):
 			s.sendError("room is full")
+		case errors.Is(err, room.ErrRoomNotFound):
+			s.sendError("room not found")
 		default:
 			s.failJoin(logger, err)
 		}

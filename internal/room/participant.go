@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/mo-nada/sfu-engine/internal/peer"
+	"github.com/mo-nada/sfu-engine/pkg/token"
 )
 
 // Participant is one client in a room. It uses two PeerConnections:
@@ -24,15 +25,37 @@ type Participant struct {
 	notify     Notifier
 	joinedAt   time.Time
 
-	mu    sync.Mutex
-	muted map[string]bool // source -> muted
+	// applyMu serializes permission and server-mute changes, which update
+	// both the participant (under the Manager lock) and the router (after it).
+	applyMu sync.Mutex
+
+	mu          sync.Mutex
+	muted       map[string]bool // source -> muted (as everyone sees it)
+	serverMuted map[string]bool // source -> muted by the server
+	grants      token.Grants
 }
 
 // NewParticipant creates a participant. Either peer may be nil if it has not
 // been created yet. notify receives room events and may be nil.
 func NewParticipant(id string, publisher, subscriber *peer.Peer, notify Notifier) *Participant {
 	return &Participant{id: id, publisher: publisher, subscriber: subscriber, notify: notify,
-		joinedAt: time.Now(), muted: make(map[string]bool)}
+		joinedAt: time.Now(), muted: make(map[string]bool), serverMuted: make(map[string]bool),
+		grants: token.Grants{Publish: true, Subscribe: true}}
+}
+
+// SetGrants sets the permissions before the participant joins. After that,
+// use Manager.UpdateGrants.
+func (p *Participant) SetGrants(g token.Grants) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.grants = g
+}
+
+// Grants returns the current permissions.
+func (p *Participant) Grants() token.Grants {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.grants
 }
 
 func (p *Participant) send(e Event) {

@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"sort"
 	"sync"
+	"sync/atomic"
 
 	"github.com/pion/rtcp"
 	"github.com/pion/rtp"
@@ -37,8 +38,17 @@ type Router struct {
 	mu          sync.Mutex
 	subscribers map[string]*peer.Peer      // participant ID -> subscribe peer
 	tracks      map[string]*publishedTrack // track key -> track
-	closed      bool
+	// blocked holds why a publisher's source must not be forwarded:
+	// publisher ID -> source -> reasons (BlockServerMute, BlockNotAllowed).
+	blocked map[string]map[string]map[string]bool
+	closed  bool
 }
+
+// Reasons for not forwarding a source.
+const (
+	BlockServerMute = "server-mute"
+	BlockNotAllowed = "not-allowed"
+)
 
 type publishedTrack struct {
 	key         string
@@ -48,6 +58,9 @@ type publishedTrack struct {
 	remote      *webrtc.TrackRemote
 	local       *webrtc.TrackLocalStaticRTP
 	senders     map[string]*webrtc.RTPSender // subscriber ID -> sender
+	// paused stops forwarding without removing the track, so it can resume
+	// at once (server mute, or a source not allowed by the grants).
+	paused atomic.Bool
 }
 
 // NewRouter creates an empty Router.
@@ -56,6 +69,7 @@ func NewRouter(logger *slog.Logger) *Router {
 		logger:      logger,
 		subscribers: make(map[string]*peer.Peer),
 		tracks:      make(map[string]*publishedTrack),
+		blocked:     make(map[string]map[string]map[string]bool),
 	}
 }
 
@@ -94,6 +108,7 @@ func (r *Router) Publish(publisherID, source string, publisher *peer.Peer, remot
 		return ErrTrackExists
 	}
 	r.tracks[key] = t
+	t.paused.Store(r.isBlocked(publisherID, source))
 	var changed []*peer.Peer
 	for subID, sub := range r.subscribers {
 		if subID != publisherID && r.attach(t, subID, sub) {
@@ -135,6 +150,75 @@ func (r *Router) AddSubscriber(participantID string, sub *peer.Peer) {
 			r.requestKeyframe(t)
 		}
 	}
+}
+
+// SetBlocked turns one reason for not forwarding publisherID's source on or
+// off. A source is forwarded only when no reason is on. It also applies to
+// tracks published later. When forwarding resumes, the publisher is asked
+// for a keyframe so subscribers recover at once.
+func (r *Router) SetBlocked(publisherID, source, reason string, on bool) {
+	r.mu.Lock()
+	bySource := r.blocked[publisherID]
+	if bySource == nil {
+		bySource = make(map[string]map[string]bool)
+		r.blocked[publisherID] = bySource
+	}
+	if bySource[source] == nil {
+		bySource[source] = make(map[string]bool)
+	}
+	if on {
+		bySource[source][reason] = true
+	} else {
+		delete(bySource[source], reason)
+	}
+	paused := r.isBlocked(publisherID, source)
+	var resumed []*publishedTrack
+	for _, t := range r.tracks {
+		if t.publisherID == publisherID && t.source == source {
+			if t.paused.Swap(paused) && !paused {
+				resumed = append(resumed, t)
+			}
+		}
+	}
+	r.mu.Unlock()
+
+	for _, t := range resumed {
+		r.requestKeyframe(t)
+	}
+}
+
+// isBlocked must be called with r.mu held.
+func (r *Router) isBlocked(publisherID, source string) bool {
+	return len(r.blocked[publisherID][source]) > 0
+}
+
+// Unsubscribe stops sending media to participantID: its tracks are removed
+// from sub and sub is renegotiated. Only sub itself is affected. Unlike
+// RemoveSubscriber, the peer stays open (for example, permissions changed).
+func (r *Router) Unsubscribe(participantID string, sub *peer.Peer) {
+	r.mu.Lock()
+	if r.subscribers[participantID] != sub {
+		r.mu.Unlock()
+		return
+	}
+	delete(r.subscribers, participantID)
+	changed := false
+	for _, t := range r.tracks {
+		if sender, ok := t.senders[participantID]; ok {
+			delete(t.senders, participantID)
+			if err := sub.RemoveTrack(sender); err != nil {
+				r.logger.Warn("remove track failed", "track", t.key, "subscriber_id", participantID, "err", err)
+				continue
+			}
+			changed = true
+		}
+	}
+	r.mu.Unlock()
+
+	if changed {
+		r.negotiate([]*peer.Peer{sub})
+	}
+	r.logger.Info("subscriber removed", "participant_id", participantID)
 }
 
 // PublishedSources returns the sources publisherID is currently publishing, sorted.
@@ -195,6 +279,9 @@ func (r *Router) forward(t *publishedTrack) {
 		pkt, _, err := t.remote.ReadRTP()
 		if err != nil {
 			break
+		}
+		if t.paused.Load() {
+			continue // read and drop, so Pion's buffers and RTCP keep working
 		}
 		stripExtensions(pkt)
 		// A write error only means one subscriber failed; the others still get the packet.

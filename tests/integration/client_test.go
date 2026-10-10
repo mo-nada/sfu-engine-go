@@ -183,8 +183,8 @@ func (c *client) setRemote(target string, pc *webrtc.PeerConnection, sd webrtc.S
 
 // Test tenants. acme is used unless a test picks another one.
 var (
-	acme   = sfu.Tenant{ID: "acme", APIKey: "acme-key", Secret: "acme-secret-acme-secret-acme-sec"}
-	globex = sfu.Tenant{ID: "globex", APIKey: "globex-key", Secret: "globex-secret-globex-secret-glob"}
+	acme   = sfu.Tenant{ID: "acme", APIKey: "acme-key", Secret: "acme-secret-acme-secret-acme-sec", AutoCreateRooms: true}
+	globex = sfu.Tenant{ID: "globex", APIKey: "globex-key", Secret: "globex-secret-globex-secret-glob", AutoCreateRooms: true}
 )
 
 // joinToken signs a token for name in room for tenant, with grants.

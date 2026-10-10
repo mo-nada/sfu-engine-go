@@ -24,6 +24,9 @@ type Tenant struct {
 	ID     string // 1–64 letters, digits, '-' or '_'
 	APIKey string
 	Secret string // at least 32 bytes
+	// AutoCreateRooms lets a join create a missing room. When false, rooms
+	// must be created through the server API first.
+	AutoCreateRooms bool
 }
 
 // WithTenant adds a tenant. Can be used several times.

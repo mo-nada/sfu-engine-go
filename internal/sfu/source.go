@@ -10,6 +10,9 @@ const (
 	SourceScreenAudio = "screen-audio"
 )
 
+// Sources lists every track source.
+var Sources = []string{SourceCamera, SourceMicrophone, SourceScreen, SourceScreenAudio}
+
 // ValidSource reports whether s is a known track source.
 func ValidSource(s string) bool {
 	switch s {
