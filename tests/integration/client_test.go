@@ -11,8 +11,10 @@ import (
 	"github.com/pion/webrtc/v4"
 	"github.com/pion/webrtc/v4/pkg/media"
 
-	"github.com/mo-nada/sfu-engine/internal/sfu"
+	sfuinternal "github.com/mo-nada/sfu-engine/internal/sfu"
 	"github.com/mo-nada/sfu-engine/internal/signaling"
+	"github.com/mo-nada/sfu-engine/pkg/sfu"
+	"github.com/mo-nada/sfu-engine/pkg/token"
 )
 
 // client is a minimal SFU client, like a browser would be: one WebSocket and
@@ -175,9 +177,32 @@ func (c *client) setRemote(target string, pc *webrtc.PeerConnection, sd webrtc.S
 	c.pending[target] = nil
 }
 
-func (c *client) join(room string) {
+// Test tenants. acme is used unless a test picks another one.
+var (
+	acme   = sfu.Tenant{ID: "acme", APIKey: "acme-key", Secret: "acme-secret-acme-secret-acme-sec"}
+	globex = sfu.Tenant{ID: "globex", APIKey: "globex-key", Secret: "globex-secret-globex-secret-glob"}
+)
+
+// joinToken signs a token for name in room for tenant, with grants.
+func joinToken(t *testing.T, tenant sfu.Tenant, room, name string, grants token.Grants) string {
+	t.Helper()
+	c := token.New(tenant.APIKey, name, room, time.Minute)
+	c.Grants = grants
+	tok, err := token.Sign(tenant.Secret, c)
+	if err != nil {
+		t.Fatalf("sign: %v", err)
+	}
+	return tok
+}
+
+var allGrants = token.Grants{Publish: true, Subscribe: true}
+
+// join joins room as tenant acme with all permissions.
+func (c *client) join(room string) { c.joinWith(acme, room, allGrants) }
+
+func (c *client) joinWith(tenant sfu.Tenant, room string, grants token.Grants) {
 	c.t.Helper()
-	c.send(signaling.Message{Type: signaling.TypeJoin, Room: room, Participant: c.name})
+	c.send(signaling.Message{Type: signaling.TypeJoin, Token: joinToken(c.t, tenant, room, c.name, grants)})
 	select {
 	case <-c.joined:
 	case msg := <-c.errors:
@@ -188,7 +213,7 @@ func (c *client) join(room string) {
 }
 
 // publishVideo publishes one camera track.
-func (c *client) publishVideo() { c.publish(sfu.SourceCamera) }
+func (c *client) publishVideo() { c.publish(sfuinternal.SourceCamera) }
 
 // publish adds one track per source (VP8 for video sources, Opus for audio
 // sources), offers them with their sources, and sends fake media until the
@@ -198,7 +223,7 @@ func (c *client) publish(sources ...string) {
 	for _, source := range sources {
 		capability := webrtc.RTPCodecCapability{MimeType: webrtc.MimeTypeVP8}
 		sample := media.Sample{Data: []byte{0x10, 0x00, 0x00, 0x9d, 0x01, 0x2a}, Duration: 20 * time.Millisecond}
-		if source == sfu.SourceMicrophone || source == sfu.SourceScreenAudio {
+		if source == sfuinternal.SourceMicrophone || source == sfuinternal.SourceScreenAudio {
 			capability = webrtc.RTPCodecCapability{MimeType: webrtc.MimeTypeOpus, ClockRate: 48000, Channels: 2}
 			sample = media.Sample{Data: []byte{0xfc, 0xff, 0xfe}, Duration: 20 * time.Millisecond}
 		}
@@ -319,6 +344,6 @@ func wsURL(addr string) string {
 	return "ws://" + strings.TrimPrefix(addr, "http://") + "/ws"
 }
 
-func signalingJoin(room, name string) signaling.Message {
-	return signaling.Message{Type: signaling.TypeJoin, Room: room, Participant: name}
+func signalingJoin(t *testing.T, room, name string) signaling.Message {
+	return signaling.Message{Type: signaling.TypeJoin, Token: joinToken(t, acme, room, name, allGrants)}
 }

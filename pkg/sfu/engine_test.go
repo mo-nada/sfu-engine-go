@@ -16,10 +16,11 @@ func TestNewRejectsInvalidOptions(t *testing.T) {
 		"bad stun url":     WithSTUN("http://example.com"),
 		"zero shutdown":    WithShutdownTimeout(0),
 		"negative timeout": WithShutdownTimeout(-time.Second),
+		"short secret":     WithTenant(Tenant{ID: "a", APIKey: "k", Secret: "short"}),
 	}
 	for name, opt := range tests {
 		t.Run(name, func(t *testing.T) {
-			if _, err := New(opt); err == nil {
+			if _, err := New(WithDevMode(), opt); err == nil {
 				t.Error("New returned nil error")
 			}
 		})
@@ -28,6 +29,7 @@ func TestNewRejectsInvalidOptions(t *testing.T) {
 
 func TestServeAndShutdown(t *testing.T) {
 	eng, err := New(
+		WithDevMode(),
 		WithSTUN(),
 		WithLogger(slog.New(slog.NewTextHandler(io.Discard, nil))),
 		WithShutdownTimeout(2*time.Second),
@@ -62,5 +64,11 @@ func TestServeAndShutdown(t *testing.T) {
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("Serve did not return after cancel")
+	}
+}
+
+func TestNewRequiresTenants(t *testing.T) {
+	if _, err := New(); err == nil {
+		t.Error("New without tenants or dev mode succeeded")
 	}
 }

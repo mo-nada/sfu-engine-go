@@ -174,11 +174,11 @@ Avoid circular dependencies. Define interfaces only where they clarify ownership
 
 ## 6. Development Roadmap
 
-Development must follow these phases in order.
+Development must follow these phases in order, with one change decided by the user on 2026-10-10: Phase 1 is complete, and the **Platform Track** below comes next, before Phases 2–4. It brings forward the multi-tenancy, authentication and control API parts of Phase 6, and the horizontal scaling of Phase 5.
 
 ### Phase 1: Core Media Engine
 
-**Current development phase.**
+**Complete.** In addition, microphone, camera and screen share controls, participant roster and mute state (from Phase 3), and camera and screen quality settings are done.
 
 Implement the minimum viable WebRTC SFU foundation.
 
@@ -211,6 +211,25 @@ Requirements:
 - Tests cover successful negotiation, media forwarding, and important failure cases.
 
 The primary milestone is a working, minimal SFU—not a complete production-grade media platform.
+
+### Platform Track: Multi-tenant Control API and Horizontal Scaling
+
+**Current development phase.**
+
+Make the SFU a shared service that external backends control through an API, and that runs on many nodes.
+
+Requirements:
+
+1. Tenants, each with an API key and a secret. Each tenant's rooms are fully isolated from other tenants.
+2. Signed, short-lived join tokens (JWT, HS256, standard library) that carry the room, the participant identity, and permissions (publish, subscribe, allowed sources). Signaling requires a valid token.
+3. A versioned REST control API (`/v1/...`, authenticated per tenant): rooms (create, list, get, close), participants (list, remove, server-side mute, permissions), and token creation.
+4. Signed webhooks to the tenant on room and participant events.
+5. Horizontal scaling: each room lives on exactly one node; a shared store (Redis) holds node registry, load, room placement and tenant state; joins and API calls are routed to the room's node; nodes can drain for upgrades.
+6. A multi-node test (two nodes and Redis).
+
+Stages, about 300 changed lines each: (1) tenants and join tokens; (2) control API v1 on one node; (3) webhooks; (4) shared-store interface with an in-memory implementation; (5) Redis store, node registry, placement and routing; (6) multi-node test.
+
+Rooms that span several nodes (media relayed between nodes) are out of scope for now.
 
 ### Phase 2: Streaming Stability and Performance
 
@@ -301,10 +320,11 @@ Follow these principles throughout development:
 8. **Lifecycle management:** Implement deterministic cleanup for connections, goroutines, rooms, and tracks.
 9. **Testability:** Design components so their behavior can be tested independently where practical.
 10. **Observability:** Include useful structured logs and diagnostics from the beginning.
-11. **No premature distribution:** Keep the initial implementation single-node.
+11. **Horizontal scaling:** Every feature must work when the service runs on several nodes. A room and its media live on exactly one node; any other state that more than one node needs (tenants, room placement, node health) goes in the shared store, never only in one node's memory. A request may reach any node, which must route it to the room's node.
 12. **No premature abstractions:** Prefer simple, explicit designs over speculative frameworks.
 13. **Documentation:** Document public APIs, signaling messages, configuration, and important architectural decisions.
 14. **Compatibility:** Verify dependency APIs and versions instead of assuming that examples from other releases apply.
+15. **Multi-tenant isolation:** Every API call, token, room, participant, webhook and log line is scoped to one tenant. One tenant can never see or affect another tenant's data.
 
 ## 8. Performance and Reliability
 
@@ -327,17 +347,18 @@ Do not claim production readiness or specific performance guarantees without sup
 
 ## 9. Scope Restrictions for the Current Phase
 
-During Phase 1:
+During the Platform Track:
 
 - Do not implement recording.
-- Do not introduce distributed media nodes.
-- Do not build Kubernetes orchestration.
+- Do not relay media between nodes (a room stays on one node).
+- Do not build Kubernetes orchestration (Docker Compose for tests is fine).
 - Do not implement a complex transcoding pipeline.
-- Do not add billing or advanced multi-tenancy.
+- Do not add billing.
 - Do not implement advanced congestion-control or simulcast systems prematurely.
 - Do not build a custom implementation of ICE, DTLS, SRTP, or other existing protocol stacks.
+- Do not add dependencies without the user's approval (Redis client only in stage 5).
 
-Focus on a minimal, correct, testable WebRTC SFU engine.
+Focus on a correct, secure, testable multi-tenant control API that scales out by rooms.
 
 ## 10. Instructions for AI Coding Agents
 
@@ -365,10 +386,6 @@ If an architectural decision has significant long-term consequences, explain the
 
 ## 11. Current Objective
 
-The immediate objective is to implement **Phase 1: Core Media Engine**.
+The immediate objective is the **Platform Track** (see section 6), stage by stage: tenants and join tokens first, then the control API, webhooks, the shared-store interface, the Redis-backed multi-node setup, and a multi-node test.
 
-Start by inspecting the repository, validating the initial structure, and implementing the smallest vertical slice that proves the architecture:
-
-**Two WebRTC peers connect through the signaling server, one publishes a video track, and the SFU forwards that track to the other peer.**
-
-The result should be understandable, testable, and extensible enough to support the later phases without implementing those future features prematurely.
+The result must let an external backend create rooms, issue join tokens, and control participants through the API, with tenants isolated from each other, and must run on several nodes behind one entry point.

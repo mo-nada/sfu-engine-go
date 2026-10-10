@@ -3,7 +3,9 @@
 //
 // Every message is a JSON object with a "type" field:
 //
-//	client → server  join       {room, participant}  must be the first message
+//	client → server  join       {token}              must be the first message; the token
+//	                                                 (see pkg/token) names the room, the
+//	                                                 participant and its permissions
 //	server → client  joined     {room, participant, participants}
 //	                                                 participants: the others already in the
 //	                                                 room, each {id, muted: {source: bool}}
@@ -31,8 +33,6 @@
 package signaling
 
 import (
-	"regexp"
-
 	"github.com/pion/webrtc/v4"
 )
 
@@ -60,6 +60,7 @@ const (
 // Message is one signaling message. Only the fields used by its Type are set.
 type Message struct {
 	Type        string                   `json:"type"`
+	Token       string                   `json:"token,omitempty"`
 	Room        string                   `json:"room,omitempty"`
 	Participant string                   `json:"participant,omitempty"`
 	SDP         string                   `json:"sdp,omitempty"`
@@ -81,6 +82,3 @@ type ParticipantInfo struct {
 
 // maxTracks bounds the size of an offer's tracks map.
 const maxTracks = 16
-
-// validID matches room and participant IDs: 1–64 letters, digits, '-' or '_'.
-var validID = regexp.MustCompile(`^[A-Za-z0-9_-]{1,64}$`)

@@ -1,13 +1,26 @@
 asyncapi: 3.0.0
 info:
   title: SFU Engine Signaling API
-  version: 0.2.0
+  version: 0.3.0
   description: |
     WebSocket signaling protocol of the Go WebRTC SFU engine.
 
     **Connections.** Each participant uses two RTCPeerConnections:
     - **publisher**: the client offers and sends its media to the SFU.
     - **subscriber**: the SFU offers and sends the other participants' media.
+
+    **Join tokens.** `join` carries a JWT (HS256) signed by the tenant's
+    backend with the tenant secret. Claims: `iss` (tenant API key), `sub`
+    (participant identity), `room`, `exp` (required), `nbf`, `iat`, and
+    `grants: {publish, subscribe, sources}` (empty `sources` = all). Rooms are
+    per tenant: the same room name in two tenants means two separate rooms.
+    The token is checked once, when joining. Go backends can use the
+    `pkg/token` package. In development (`-dev`), `GET /dev/token` gives a token.
+
+    **Permissions.** Without `publish`, an `offer` gets the error
+    "not allowed to publish". A track whose source is not in `sources` is not
+    forwarded, and the client gets "not allowed to publish <source>". Without
+    `subscribe`, the client receives no media (it still gets roster events).
 
     **Flow.**
     1. Send `join` as the first message. The server replies with `joined`,
@@ -110,16 +123,15 @@ components:
     join:
       name: join
       title: Join a room (client → server)
-      summary: Must be the first message. The participant ID must be unique in the room.
+      summary: Must be the first message. The token names the room, the participant (unique in the room) and the permissions. An invalid token gets the error "invalid token".
       payload:
         type: object
-        required: [type, room, participant]
+        required: [type, token]
         properties:
           type: { const: join }
-          room: { $ref: '#/components/schemas/id' }
-          participant: { $ref: '#/components/schemas/id' }
+          token: { type: string, description: 'Join token (JWT, HS256), see the API description.' }
       examples:
-        - payload: { type: join, room: room1, participant: alice }
+        - payload: { type: join, token: "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOi..." }
     joined:
       name: joined
       title: Join accepted (server → client)

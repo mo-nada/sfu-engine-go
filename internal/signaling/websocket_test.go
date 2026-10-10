@@ -10,8 +10,10 @@ import (
 
 	"github.com/gorilla/websocket"
 
+	"github.com/mo-nada/sfu-engine/internal/auth"
 	"github.com/mo-nada/sfu-engine/internal/room"
 	"github.com/mo-nada/sfu-engine/internal/transport"
+	"github.com/mo-nada/sfu-engine/pkg/token"
 )
 
 func discardLogger() *slog.Logger { return slog.New(slog.NewTextHandler(io.Discard, nil)) }
@@ -23,7 +25,14 @@ func newTestServer(t *testing.T) (*httptest.Server, *room.Manager) {
 		t.Fatalf("NewAPI: %v", err)
 	}
 	rooms := room.NewManager(discardLogger())
-	h := NewHandler(api, transport.Configuration(nil), rooms, discardLogger())
+	tenants, err := auth.NewTenants([]auth.Tenant{
+		{ID: "acme", APIKey: "acme-key", Secret: acmeSecret},
+		{ID: "globex", APIKey: "globex-key", Secret: globexSecret},
+	})
+	if err != nil {
+		t.Fatalf("tenants: %v", err)
+	}
+	h := NewHandler(api, transport.Configuration(nil), rooms, tenants, discardLogger())
 	srv := httptest.NewServer(h)
 	t.Cleanup(func() {
 		h.Close()
@@ -77,9 +86,28 @@ func expectError(t *testing.T, conn *websocket.Conn, contains string) {
 	}
 }
 
+const (
+	acmeSecret   = "acme-secret-acme-secret-acme-sec"
+	globexSecret = "globex-secret-globex-secret-glob"
+)
+
+// acmeToken returns a join token of tenant "acme" with all permissions.
+func acmeToken(t *testing.T, roomID, participant string) string {
+	t.Helper()
+	tok, err := token.Sign(acmeSecret, token.New("acme-key", participant, roomID, time.Minute))
+	if err != nil {
+		t.Fatalf("sign: %v", err)
+	}
+	return tok
+}
+
+func joinMsg(t *testing.T, roomID, participant string) Message {
+	return Message{Type: TypeJoin, Token: acmeToken(t, roomID, participant)}
+}
+
 func join(t *testing.T, conn *websocket.Conn, roomID, participant string) {
 	t.Helper()
-	send(t, conn, Message{Type: TypeJoin, Room: roomID, Participant: participant})
+	send(t, conn, joinMsg(t, roomID, participant))
 	if msg := next(t, conn); msg.Type != TypeJoined || msg.Room != roomID || msg.Participant != participant {
 		t.Fatalf("got %+v, want joined", msg)
 	}
@@ -106,7 +134,7 @@ func TestJoinSendsJoinedThenSubscriberOffer(t *testing.T) {
 	if offer.Type != TypeOffer || !strings.Contains(offer.SDP, "m=application") {
 		t.Fatalf("got %+v, want subscriber offer with a data channel section", offer)
 	}
-	r, ok := rooms.Room("r1")
+	r, ok := rooms.Room("acme/r1")
 	if !ok {
 		t.Fatal("room not created")
 	}
@@ -128,16 +156,17 @@ func TestBadMessagesGetErrors(t *testing.T) {
 	}
 	expectError(t, conn, "invalid JSON")
 
-	send(t, conn, Message{Type: TypeJoin, Room: "bad room!", Participant: "alice"})
-	expectError(t, conn, "letters, digits")
-	send(t, conn, Message{Type: TypeJoin, Room: "r1", Participant: ""})
-	expectError(t, conn, "letters, digits")
+	send(t, conn, Message{Type: TypeJoin, Token: "not-a-token"})
+	expectError(t, conn, "invalid token")
+	forged, _ := token.Sign(globexSecret, token.New("acme-key", "alice", "r1", time.Minute))
+	send(t, conn, Message{Type: TypeJoin, Token: forged})
+	expectError(t, conn, "invalid token")
 
 	join(t, conn, "r1", "alice")
 	if msg := next(t, conn); msg.Type != TypeOffer {
 		t.Fatalf("got %+v, want subscriber offer", msg)
 	}
-	send(t, conn, Message{Type: TypeJoin, Room: "r1", Participant: "alice"})
+	send(t, conn, joinMsg(t, "r1", "alice"))
 	expectError(t, conn, "already joined")
 
 	send(t, conn, Message{Type: "dance"})
@@ -155,7 +184,7 @@ func TestDuplicateParticipantRejected(t *testing.T) {
 	join(t, dial(t, srv), "r1", "alice")
 
 	second := dial(t, srv)
-	send(t, second, Message{Type: TypeJoin, Room: "r1", Participant: "alice"})
+	send(t, second, joinMsg(t, "r1", "alice"))
 	expectError(t, second, "already in room")
 
 	// The rejected connection can still join with another ID.
@@ -169,7 +198,7 @@ func TestDisconnectLeavesRoom(t *testing.T) {
 
 	_ = conn.Close()
 	eventually(t, "room removed after disconnect", func() bool {
-		_, ok := rooms.Room("r1")
+		_, ok := rooms.Room("acme/r1")
 		return !ok
 	})
 }
@@ -181,7 +210,7 @@ func TestLeaveMessageClosesSession(t *testing.T) {
 
 	send(t, conn, Message{Type: TypeLeave})
 	eventually(t, "room removed after leave", func() bool {
-		_, ok := rooms.Room("r1")
+		_, ok := rooms.Room("acme/r1")
 		return !ok
 	})
 	expectClosed(t, conn)
@@ -199,7 +228,7 @@ func TestBadAnswerDisconnects(t *testing.T) {
 	expectError(t, conn, "invalid answer")
 	expectClosed(t, conn)
 	eventually(t, "room removed", func() bool {
-		_, ok := rooms.Room("r1")
+		_, ok := rooms.Room("acme/r1")
 		return !ok
 	})
 }
@@ -221,7 +250,7 @@ func expectClosed(t *testing.T, conn *websocket.Conn) {
 func TestJoinedListsOthersAndEventsFollow(t *testing.T) {
 	srv, _ := newTestServer(t)
 	alice := dial(t, srv)
-	send(t, alice, Message{Type: TypeJoin, Room: "r1", Participant: "alice"})
+	send(t, alice, joinMsg(t, "r1", "alice"))
 	first := next(t, alice)
 	if first.Type != TypeJoined || first.Participants == nil || len(first.Participants) != 0 {
 		t.Fatalf("alice joined = %+v, want empty participants list", first)
@@ -230,7 +259,7 @@ func TestJoinedListsOthersAndEventsFollow(t *testing.T) {
 	send(t, alice, Message{Type: TypeMute, Source: "microphone", Muted: &muted})
 
 	bob := dial(t, srv)
-	send(t, bob, Message{Type: TypeJoin, Room: "r1", Participant: "bob"})
+	send(t, bob, joinMsg(t, "r1", "bob"))
 	joined := next(t, bob)
 	if joined.Type != TypeJoined || len(joined.Participants) != 1 ||
 		joined.Participants[0].ID != "alice" || !joined.Participants[0].Muted["microphone"] {
@@ -271,4 +300,38 @@ func nextOfType(t *testing.T, conn *websocket.Conn, typ string) Message {
 			return msg
 		}
 	}
+}
+
+// The same room name in two tenants gives two separate rooms.
+func TestTenantsAreIsolated(t *testing.T) {
+	srv, rooms := newTestServer(t)
+	join(t, dial(t, srv), "r1", "alice")
+
+	bob := dial(t, srv)
+	tok, _ := token.Sign(globexSecret, token.New("globex-key", "bob", "r1", time.Minute))
+	send(t, bob, Message{Type: TypeJoin, Token: tok})
+	joined := next(t, bob)
+	if joined.Type != TypeJoined || len(joined.Participants) != 0 {
+		t.Fatalf("globex bob joined = %+v, want an empty room", joined)
+	}
+	if _, ok := rooms.Room("acme/r1"); !ok {
+		t.Error("acme room missing")
+	}
+	if _, ok := rooms.Room("globex/r1"); !ok {
+		t.Error("globex room missing")
+	}
+}
+
+func TestPublishNotGranted(t *testing.T) {
+	srv, _ := newTestServer(t)
+	conn := dial(t, srv)
+	c := token.New("acme-key", "viewer", "r1", time.Minute)
+	c.Grants.Publish = false
+	tok, _ := token.Sign(acmeSecret, c)
+	send(t, conn, Message{Type: TypeJoin, Token: tok})
+	if msg := next(t, conn); msg.Type != TypeJoined {
+		t.Fatalf("got %+v, want joined", msg)
+	}
+	send(t, conn, Message{Type: TypeOffer, SDP: "v=0"})
+	expectError(t, conn, "not allowed to publish")
 }

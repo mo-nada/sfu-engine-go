@@ -14,6 +14,7 @@ import (
 
 	sfuinternal "github.com/mo-nada/sfu-engine/internal/sfu"
 	"github.com/mo-nada/sfu-engine/pkg/sfu"
+	"github.com/mo-nada/sfu-engine/pkg/token"
 )
 
 // startServer runs an Engine on a random local port without STUN and returns
@@ -21,6 +22,8 @@ import (
 func startServer(t *testing.T) string {
 	t.Helper()
 	eng, err := sfu.New(
+		sfu.WithTenant(acme),
+		sfu.WithTenant(globex),
 		sfu.WithSTUN(),
 		sfu.WithLogger(slog.New(slog.NewTextHandler(io.Discard, nil))),
 		sfu.WithShutdownTimeout(2*time.Second),
@@ -162,7 +165,7 @@ func TestDuplicateNameRejected(t *testing.T) {
 	first.join("room1")
 
 	second := newClient(t, url, "alice")
-	second.send(signalingJoin("room1", "alice"))
+	second.send(signalingJoin(t, "room1", "alice"))
 	select {
 	case msg := <-second.errors:
 		if msg != "participant already in room" {
@@ -205,4 +208,48 @@ func TestCameraMicrophoneAndScreenShare(t *testing.T) {
 		return bob.receivedKind("alice/media", webrtc.RTPCodecTypeVideo) > video+10 &&
 			bob.receivedKind("alice/media", webrtc.RTPCodecTypeAudio) > audio+10
 	})
+}
+
+// Two tenants use the same room name: their participants never meet.
+func TestTenantsDoNotSeeEachOther(t *testing.T) {
+	url := startServer(t)
+
+	alice := newClient(t, url, "alice")
+	alice.join("room1") // tenant acme
+	bob := newClient(t, url, "bob")
+	bob.joinWith(globex, "room1", allGrants)
+	carol := newClient(t, url, "carol")
+	carol.join("room1") // acme
+
+	alice.publishVideo()
+	eventually(t, "carol (same tenant) receives alice", func() bool { return carol.received("alice/media") >= 10 })
+	if n := bob.received("alice/media"); n != 0 {
+		t.Errorf("bob (other tenant) received %d packets from alice, want 0", n)
+	}
+}
+
+// A token that allows only camera and microphone: a screen share is not
+// forwarded, and the publisher gets an error.
+func TestGrantsLimitSources(t *testing.T) {
+	url := startServer(t)
+
+	alice := newClient(t, url, "alice")
+	alice.joinWith(acme, "room1", token.Grants{Publish: true, Subscribe: true, Sources: []string{"camera", "microphone"}})
+	bob := newClient(t, url, "bob")
+	bob.join("room1")
+
+	alice.publish(sfuinternal.SourceCamera, sfuinternal.SourceScreen)
+
+	eventually(t, "bob receives alice's camera", func() bool { return bob.received("alice/media") >= 10 })
+	select {
+	case msg := <-alice.errors:
+		if msg != "not allowed to publish screen" {
+			t.Errorf("error = %q", msg)
+		}
+	case <-time.After(5 * time.Second):
+		t.Error("no error for the screen track")
+	}
+	if n := bob.received("alice/screen"); n != 0 {
+		t.Errorf("bob received %d screen packets, want 0", n)
+	}
 }

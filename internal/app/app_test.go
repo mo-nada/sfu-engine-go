@@ -2,6 +2,7 @@ package app
 
 import (
 	"context"
+	"encoding/json"
 	"io"
 	"log/slog"
 	"net"
@@ -12,6 +13,7 @@ import (
 
 	"github.com/gorilla/websocket"
 
+	"github.com/mo-nada/sfu-engine/internal/auth"
 	"github.com/mo-nada/sfu-engine/internal/config"
 	"github.com/mo-nada/sfu-engine/internal/signaling"
 )
@@ -22,7 +24,7 @@ func TestServeHealthzAndShutdown(t *testing.T) {
 		t.Fatalf("listen: %v", err)
 	}
 
-	cfg := config.Default()
+	cfg := devConfig()
 	cfg.ShutdownTimeout = 2 * time.Second
 	a := newApp(t, cfg)
 
@@ -53,7 +55,7 @@ func TestServeHealthzAndShutdown(t *testing.T) {
 }
 
 func TestRunListenError(t *testing.T) {
-	cfg := config.Default()
+	cfg := devConfig()
 	cfg.Addr = "not-a-valid-address"
 	a := newApp(t, cfg)
 	if err := a.Run(context.Background()); err == nil {
@@ -77,7 +79,7 @@ func TestShutdownClosesSignalingAndRooms(t *testing.T) {
 	if err != nil {
 		t.Fatalf("listen: %v", err)
 	}
-	cfg := config.Default()
+	cfg := devConfig()
 	cfg.STUNURLs = nil
 	cfg.ShutdownTimeout = 2 * time.Second
 	a := newApp(t, cfg)
@@ -92,7 +94,7 @@ func TestShutdownClosesSignalingAndRooms(t *testing.T) {
 		t.Fatalf("dial /ws: %v", err)
 	}
 	defer conn.Close()
-	if err := conn.WriteJSON(signaling.Message{Type: signaling.TypeJoin, Room: "r1", Participant: "alice"}); err != nil {
+	if err := conn.WriteJSON(signaling.Message{Type: signaling.TypeJoin, Token: devToken(t, ln.Addr().String(), "r1", "alice")}); err != nil {
 		t.Fatalf("write join: %v", err)
 	}
 	var joined signaling.Message
@@ -100,7 +102,7 @@ func TestShutdownClosesSignalingAndRooms(t *testing.T) {
 	if err := conn.ReadJSON(&joined); err != nil || joined.Type != signaling.TypeJoined {
 		t.Fatalf("got %+v (err %v), want joined", joined, err)
 	}
-	if _, ok := a.rooms.Room("r1"); !ok {
+	if _, ok := a.rooms.Room("dev/r1"); !ok {
 		t.Fatal("room not created")
 	}
 
@@ -123,7 +125,7 @@ func TestShutdownClosesSignalingAndRooms(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("Serve did not return after cancel")
 	}
-	if _, ok := a.rooms.Room("r1"); ok {
+	if _, ok := a.rooms.Room("dev/r1"); ok {
 		t.Error("room still exists after shutdown")
 	}
 }
@@ -133,7 +135,7 @@ func TestServesPagesAndAPIDocs(t *testing.T) {
 	if err != nil {
 		t.Fatalf("listen: %v", err)
 	}
-	a := newApp(t, config.Default())
+	a := newApp(t, devConfig())
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
 	go func() { done <- a.Serve(ctx, ln) }()
@@ -173,5 +175,73 @@ func TestServesPagesAndAPIDocs(t *testing.T) {
 	resp.Body.Close()
 	if resp.StatusCode != http.StatusNotFound {
 		t.Errorf("GET /missing = %d, want 404", resp.StatusCode)
+	}
+}
+
+func devConfig() config.Config {
+	cfg := config.Default()
+	cfg.Dev = true
+	return cfg
+}
+
+// devToken gets a join token from the dev endpoint.
+func devToken(t *testing.T, addr, roomID, participant string) string {
+	t.Helper()
+	resp, err := http.Get("http://" + addr + "/dev/token?room=" + roomID + "&participant=" + participant)
+	if err != nil {
+		t.Fatalf("GET /dev/token: %v", err)
+	}
+	defer resp.Body.Close()
+	var body struct {
+		Token string `json:"token"`
+	}
+	if resp.StatusCode != http.StatusOK || json.NewDecoder(resp.Body).Decode(&body) != nil || body.Token == "" {
+		t.Fatalf("GET /dev/token = %d", resp.StatusCode)
+	}
+	return body.Token
+}
+
+func TestDevTokenEndpoint(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	a := newApp(t, devConfig())
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- a.Serve(ctx, ln) }()
+	defer func() { cancel(); <-done }()
+
+	_ = devToken(t, ln.Addr().String(), "r1", "alice")
+	resp, err := http.Get("http://" + ln.Addr().String() + "/dev/token?room=bad%20room&participant=alice")
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Errorf("invalid room: status %d, want 400", resp.StatusCode)
+	}
+}
+
+func TestNoDevTokenWithoutDevMode(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg := config.Default()
+	cfg.Tenants = []auth.Tenant{{ID: "acme", APIKey: "k", Secret: "0123456789abcdef0123456789abcdef"}}
+	a := newApp(t, cfg)
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- a.Serve(ctx, ln) }()
+	defer func() { cancel(); <-done }()
+
+	resp, err := http.Get("http://" + ln.Addr().String() + "/dev/token?room=r1&participant=alice")
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusNotFound {
+		t.Errorf("/dev/token without dev mode: status %d, want 404", resp.StatusCode)
 	}
 }

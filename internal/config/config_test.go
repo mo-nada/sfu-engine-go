@@ -7,7 +7,7 @@ import (
 )
 
 func TestLoadDefaults(t *testing.T) {
-	cfg, err := Load(nil)
+	cfg, err := Load([]string{"-dev"})
 	if err != nil {
 		t.Fatalf("Load: %v", err)
 	}
@@ -26,11 +26,12 @@ func TestLoadFlags(t *testing.T) {
 		"-log-format", "json",
 		"-stun", " stun:a.example:3478 , stun:b.example:3478 ,",
 		"-shutdown-timeout", "3s",
+		"-tenants", "tenants.json",
 	})
 	if err != nil {
 		t.Fatalf("Load: %v", err)
 	}
-	if cfg.Addr != ":9000" || cfg.LogLevel != "debug" || cfg.LogFormat != "json" || cfg.ShutdownTimeout != 3*time.Second {
+	if cfg.Addr != ":9000" || cfg.LogLevel != "debug" || cfg.LogFormat != "json" || cfg.ShutdownTimeout != 3*time.Second || cfg.TenantsFile != "tenants.json" {
 		t.Errorf("flags not applied: %+v", cfg)
 	}
 	if !slices.Equal(cfg.STUNURLs, []string{"stun:a.example:3478", "stun:b.example:3478"}) {
@@ -39,7 +40,7 @@ func TestLoadFlags(t *testing.T) {
 }
 
 func TestLoadEmptySTUNDisablesIt(t *testing.T) {
-	cfg, err := Load([]string{"-stun", ""})
+	cfg, err := Load([]string{"-dev", "-stun", ""})
 	if err != nil {
 		t.Fatalf("Load: %v", err)
 	}
@@ -56,10 +57,12 @@ func TestValidateRejectsBadValues(t *testing.T) {
 		"bad stun url":     func(c *Config) { c.STUNURLs = []string{"http://example.com"} },
 		"zero shutdown":    func(c *Config) { c.ShutdownTimeout = 0 },
 		"negative timeout": func(c *Config) { c.ShutdownTimeout = -time.Second },
+		"no tenants":       func(c *Config) { c.Dev = false },
 	}
 	for name, mutate := range tests {
 		t.Run(name, func(t *testing.T) {
 			cfg := Default()
+			cfg.Dev = true
 			mutate(&cfg)
 			if err := cfg.Validate(); err == nil {
 				t.Error("Validate returned nil, want error")

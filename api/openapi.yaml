@@ -1,15 +1,16 @@
 openapi: 3.1.0
 info:
   title: SFU Engine HTTP API
-  version: 0.2.0
+  version: 0.3.0
   summary: HTTP endpoints of the Go WebRTC SFU engine.
   description: |
     The SFU has a small HTTP surface. Almost all interaction happens over the
     WebSocket signaling connection at `/ws`. Its messages are described in the
     AsyncAPI document at `/api/asyncapi.yaml` (rendered at `/docs/signaling`).
 
-    There is no authentication yet: anyone who can reach the server can join
-    any room. Browsers may only open `/ws` from pages served by the same host.
+    Joining a room needs a join token (JWT, HS256) signed by a tenant; see the
+    AsyncAPI document for the claims. Browsers may only open `/ws` from pages
+    served by the same host.
   license:
     name: See repository
 servers:
@@ -57,6 +58,32 @@ paths:
           description: Not a valid WebSocket upgrade request.
         "403":
           description: Cross-origin browser request rejected.
+  /dev/token:
+    get:
+      tags: [demo]
+      operationId: devToken
+      summary: Development join token (only with -dev)
+      description: |
+        Returns a one-hour join token with all permissions for the development
+        tenant. Exists only when the server runs with `-dev` (404 otherwise).
+        Never enable in production: it gives tokens to anyone.
+      parameters:
+        - { name: room, in: query, required: true, schema: { type: string, pattern: '^[A-Za-z0-9_-]{1,64}$' } }
+        - { name: participant, in: query, required: true, schema: { type: string, pattern: '^[A-Za-z0-9_-]{1,64}$' } }
+      responses:
+        "200":
+          description: A join token.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [token]
+                properties:
+                  token: { type: string }
+        "400":
+          description: Invalid room or participant.
+        "404":
+          description: The server is not in development mode.
   /healthz:
     get:
       tags: [operations]

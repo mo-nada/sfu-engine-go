@@ -13,6 +13,34 @@ type options struct {
 	stunURLs        []string
 	logger          *slog.Logger
 	shutdownTimeout time.Duration
+	tenantsFile     string
+	tenants         []Tenant
+	dev             bool
+}
+
+// Tenant is a customer system allowed to use the engine. Its backend signs
+// join tokens (see package token) with APIKey as issuer and Secret as key.
+type Tenant struct {
+	ID     string // 1–64 letters, digits, '-' or '_'
+	APIKey string
+	Secret string // at least 32 bytes
+}
+
+// WithTenant adds a tenant. Can be used several times.
+func WithTenant(t Tenant) Option {
+	return func(o *options) { o.tenants = append(o.tenants, t) }
+}
+
+// WithTenantsFile loads tenants from a JSON file:
+// {"tenants": [{"id": "...", "api_key": "...", "secret": "..."}]}.
+func WithTenantsFile(path string) Option {
+	return func(o *options) { o.tenantsFile = path }
+}
+
+// WithDevMode adds a development tenant with a random secret and serves
+// GET /dev/token, which gives a join token to anyone. Never use in production.
+func WithDevMode() Option {
+	return func(o *options) { o.dev = true }
 }
 
 // WithAddr sets the HTTP listen address used by Run. Default ":8080".

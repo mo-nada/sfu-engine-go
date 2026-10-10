@@ -16,8 +16,12 @@ the SFU. It is a working minimal SFU, not a production-ready platform yet. See
 Requirements: Go 1.27 or newer.
 
 ```bash
-go run ./cmd/sfu
+go run ./cmd/sfu -dev
 ```
+
+`-dev` adds a development tenant and the `/dev/token` endpoint, which the demo
+page uses to get join tokens. Never use `-dev` in production. For real use, pass
+a tenants file instead (see [Tenants and join tokens](#tenants-and-join-tokens)).
 
 Then open <http://localhost:8080> in two browser tabs (or two browsers). In each tab,
 enter the same room and a different name, then click **Join**. Each tab sends its
@@ -36,6 +40,10 @@ another machine, put the server behind HTTPS (for example, a reverse proxy).
 | `-log-format` | `text` | `text` (colored in a terminal) or `json` |
 | `-stun` | `stun:stun.l.google.com:19302` | Comma-separated STUN URLs. Pass `-stun ""` to disable |
 | `-shutdown-timeout` | `10s` | Maximum time for graceful shutdown |
+| `-tenants` | none | JSON file with tenants (see `tenants.example.json`) |
+| `-dev` | off | Development tenant and open `/dev/token` endpoint. Never in production |
+
+The server needs `-tenants` or `-dev` to start.
 
 Set `NO_COLOR=1` to disable colored logs.
 
@@ -46,6 +54,7 @@ Set `NO_COLOR=1` to disable colored logs.
 | `GET /` | Browser demo page for joining a room |
 | `GET /ws` | WebSocket signaling |
 | `GET /healthz` | Health check, returns `200 ok` |
+| `GET /dev/token?room=&participant=` | Development join token (only with `-dev`) |
 | `GET /docs` | HTTP API documentation (Swagger UI) |
 | `GET /docs/signaling` | Signaling protocol documentation (AsyncAPI viewer) |
 | `GET /api/openapi.yaml` | OpenAPI 3.1 document for the HTTP endpoints |
@@ -55,6 +64,38 @@ The two `/docs` pages load their viewers from the public unpkg CDN, so the
 browser needs internet access to show them. The YAML documents are served by the
 SFU itself, and other systems can use them to generate clients.
 
+## Tenants and join tokens
+
+The SFU is a shared service. Each **tenant** (a customer system) has an ID, an
+API key and a secret of at least 32 bytes:
+
+```json
+{"tenants": [{"id": "acme", "api_key": "acme-key", "secret": "…at least 32 random bytes…"}]}
+```
+
+The tenant's backend gives each user a short-lived **join token**: a JWT signed
+with HS256 using the tenant secret. Its claims are:
+
+| Claim | Meaning |
+|---|---|
+| `iss` | the tenant API key |
+| `sub` | the participant identity |
+| `room` | the room name |
+| `exp` | expiry time (required) |
+| `nbf`, `iat` | optional validity start and issue time |
+| `grants` | `{publish, subscribe, sources}`; empty `sources` means all sources |
+
+The browser sends the token in `join`. Rooms are separate per tenant: the same
+room name in two tenants is two different rooms.
+
+Go backends can create tokens with `pkg/token`:
+
+```go
+c := token.New("acme-key", "alice", "room1", time.Hour)
+c.Grants.Sources = []string{"camera", "microphone"} // no screen share
+tok, err := token.Sign(secret, c)
+```
+
 ## Embedding in a Go application
 
 ```go
@@ -62,6 +103,7 @@ import "github.com/mo-nada/sfu-engine/pkg/sfu"
 
 eng, err := sfu.New(
 	sfu.WithAddr(":8080"),
+	sfu.WithTenantsFile("tenants.json"), // or sfu.WithTenant(sfu.Tenant{...})
 	sfu.WithSTUN("stun:stun.l.google.com:19302"), // sfu.WithSTUN() disables STUN
 	sfu.WithLogger(slog.Default()),
 	sfu.WithShutdownTimeout(10*time.Second),
@@ -93,7 +135,7 @@ can never collide.
 
 | Direction | `type` | Fields | Meaning |
 |---|---|---|---|
-| client → server | `join` | `room`, `participant` | Must be the first message. IDs are 1–64 letters, digits, `-` or `_` |
+| client → server | `join` | `token` | Must be the first message. The join token names the room, the participant and the permissions |
 | server → client | `joined` | `room`, `participant`, `participants` | Join accepted. `participants` lists the others: `[{id, muted: {source: bool}}]`. A subscriber `offer` follows |
 | server → client | `participant-joined` / `participant-left` | `participant` | Someone else joined or left |
 | client → server | `offer` | `sdp`, `tracks` | Offer on the **publisher** connection. `tracks` maps each track ID to `camera`, `microphone`, `screen` or `screen-audio` |
@@ -177,7 +219,8 @@ isolation, disconnect cleanup, and duplicate names.
 
 These are planned for later phases:
 
-- **No authentication.** Anyone who can reach `/ws` can join any room (Phase 6).
+- **No control API or webhooks yet.** These come in the next Platform Track stages.
+- **Single node.** Horizontal scaling comes in the next Platform Track stages.
 - **Same-origin browsers only.** A web page served from another host cannot
   connect to `/ws`. Non-browser clients are not affected.
 - **No TURN server.** Clients behind strict NATs or firewalls may not connect.

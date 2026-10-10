@@ -6,21 +6,28 @@ same change as any change to architecture, ownership, protocol, public API,
 endpoints, or key decisions. The protocol and endpoints are documented in
 detail in `api/asyncapi.yaml` and `api/openapi.yaml`.
 
-Last updated: 2026-10-10 (Phase 1 done, plus Phase 3 controls: microphone,
-camera, screen share, roster, mute).
+Last updated: 2026-10-10. Phase 1 is done, plus the Phase 3 controls
+(microphone, camera, screen share, roster, mute) and the quality settings. The
+current phase is the **Platform Track** (see CLAUDE.md section 6): multi-tenant
+control API and horizontal scaling. Stage 1 (tenants and join tokens) is done.
 
 ## What it is
 
 A Go WebRTC SFU on Pion WebRTC v4. Publishers send RTP once, and the SFU
 forwards it unchanged to the other participants in the same room. There is no
-transcoding. Single node, no auth yet.
+transcoding. It is a multi-tenant service: tenants' backends issue join tokens.
+It runs on a single node for now; horizontal scaling is being built (each room
+on one node, shared store in Valkey or Redis).
 
 - Module: `github.com/mo-nada/sfu-engine`, Go 1.27.
 - Direct dependencies: `pion/webrtc/v4`, `pion/rtcp`, `pion/interceptor`,
   `gorilla/websocket`, `lmittmann/tint`. `testify` and `uuid` are listed in
   `go.mod` but not used. **Do not run `go mod tidy`**: it removes them, and the
   user decides on dependencies.
-- Run: `go run ./cmd/sfu` → <http://localhost:8080>. Test: `go test -race ./...`.
+- Run: `go run ./cmd/sfu -dev` → <http://localhost:8080>. Test: `go test -race ./...`.
+- Local Valkey (a Redis-compatible store) runs in Docker on `localhost:6379`
+  (container `valkey`, image `valkey/valkey:9`). It is meant for the shared-store
+  stages.
 - Dev environment: WSL2. The browser runs on Windows and reaches the server via
   `localhost` forwarding.
 
@@ -29,9 +36,11 @@ transcoding. Single node, no auth yet.
 | Package | Owns / does |
 |---|---|
 | `cmd/sfu` | flags → `config.Load` → `observability.NewLogger` → `app.New` → `Run`; Ctrl+C or SIGTERM cancels ctx |
-| `internal/config` | `Config` (Addr, LogLevel, LogFormat, STUNURLs, ShutdownTimeout), flags, `Validate` |
+| `internal/config` | `Config` (Addr, LogLevel, LogFormat, STUNURLs, ShutdownTimeout, TenantsFile, Tenants, Dev), flags, `Validate` (needs tenants or dev) |
+| `internal/auth` | `Tenant{ID, APIKey, Secret}`, `NewTenants` (validates: unique id and key, secret ≥ 32 bytes), `LoadTenants(json)`, `DevTenant` (random secret), `VerifyJoinToken` |
+| `pkg/token` | Public, stdlib only: JWT HS256 `Claims{iss=api key, sub, room, iat, nbf, exp, grants{publish, subscribe, sources}}`, `New`, `Sign`, `Verify` (rejects other algorithms, 30 s leeway) |
 | `internal/observability` | `NewLogger`: tint colored text in a terminal (respects `NO_COLOR`), JSON otherwise |
-| `internal/app` | Wires the Pion API, `room.Manager`, `signaling.Handler`, routes. `Serve` shutdown order: HTTP Shutdown → `signaling.Close` (parallel) → `rooms.Close` |
+| `internal/app` | Wires the Pion API, tenants (file + programmatic + dev), `room.Manager`, `signaling.Handler`, routes (`/dev/token` only with `-dev`). `Serve` shutdown order: HTTP Shutdown → `signaling.Close` (parallel) → `rooms.Close` |
 | `internal/transport` | `NewAPI()` (default codecs and interceptors; one API is shared, Pion copies the MediaEngine per PC), `Configuration(stunURLs)` |
 | `internal/peer` | `Peer` = one PeerConnection. `HandleOffer` (client offers), `Negotiate` / `OnOffer` / `HandleAnswer` (server offers, **one offer in flight**, extra requests merged into one follow-up), early ICE candidate queue (max 64), `OnTrack`, `AddTrack` / `RemoveTrack`, `WriteRTCP`, `CreateDataChannel`, `Close` (idempotent; `OnClose` runs once, **outside** `sync.Once`) |
 | `internal/room` | `Manager` → `Room` → `Participant`. Manager lock serializes Join, Leave and SetMuted **and the event notifications**, so all participants see events in one order. A Room owns one `sfu.Router`. A Participant owns two peers (publisher, subscriber), mute state, and a non-blocking `Notifier` |
@@ -39,20 +48,26 @@ transcoding. Single node, no auth yet.
 | `internal/signaling` | WebSocket `Handler`; one `session` per connection with **3 goroutines**: readLoop (handles messages in order), writeLoop (the only writer; `send` queues up to 256 and never blocks, and a full queue disconnects the slow client), pingLoop (30 s ping, 60 s pong timeout) |
 | `internal/web` | Embedded pages: `/` demo client, `/docs` (Swagger UI from CDN), `/docs/signaling` (AsyncAPI viewer from CDN) |
 | `api` | `openapi.yaml`, `asyncapi.yaml` (embedded, served at `/api/...`) |
-| `pkg/sfu` | Public API: `New(WithAddr, WithSTUN, WithLogger, WithShutdownTimeout)`, `Run`, `Serve`. A thin layer over `internal/app` |
+| `pkg/sfu` | Public API: `New(WithAddr, WithSTUN, WithLogger, WithShutdownTimeout, WithTenant, WithTenantsFile, WithDevMode)`, `Run`, `Serve`. A thin layer over `internal/app` |
 | `tests/integration` | Real Pion clients over WebSocket against `pkg/sfu`. The test client is in `client_test.go` |
 
 ## Session lifecycle (signaling)
 
-1. `join`: the IDs are checked. The server creates the pub and sub peers, plus a
-   data channel on sub so the first offer has an m-line, and wires the ICE and
-   offer callbacks.
+1. `join {token}`: `tenants.VerifyJoinToken`. The room key is
+   `"<tenant>/<room>"`, and the identity and grants come **only** from the
+   token. The token is checked once, at join. The server then creates the pub
+   and sub peers, plus a data channel on sub so the first offer has an m-line,
+   and wires the ICE and offer callbacks.
 2. `rooms.Join(...)`: under the manager lock, the joiner's notifier gets the
    roster, which becomes the `joined` message, and the others get
    `participant-joined`.
 3. The pub `OnTrack` looks up the source from the latest offer's `tracks` map
-   and calls `Router.Publish`. Each offer's map **replaces** the previous one.
-4. `Router.AddSubscriber`, then `sub.Negotiate()` (the first subscriber offer).
+   (each offer's map **replaces** the previous one) and checks
+   `grants.AllowsSource`. A rejected track is not forwarded and the client gets
+   an error. Otherwise it calls `Router.Publish`. An `offer` without
+   `grants.Publish` is rejected.
+4. `Router.AddSubscriber` (only with `grants.Subscribe`), then `sub.Negotiate()`
+   (the first subscriber offer).
 5. `session.close()` runs once (atomic CAS) and is triggered by any of:
    - the WebSocket closing,
    - a `leave` message,
@@ -83,6 +98,21 @@ transcoding. Single node, no auth yet.
 - **Stream IDs:** `<name>/media` (camera and microphone, kept in sync) and
   `<name>/screen`.
 - **Duplicate participant ID in a room is rejected** (no kick-old behavior).
+- **Tenants and auth:**
+  - Join tokens are JWT HS256, built with the standard library only (no JWT
+    dependency), so a tenant's backend in any language can sign them.
+  - The join error is always just "invalid token"; the real reason is only
+    logged.
+  - Tenants come from a JSON file that every node loads. A later stage moves
+    them to the shared store.
+  - `-dev` is required for local runs without a tenants file.
+- **Horizontal scaling plan** (Platform Track stages 4–6):
+  - Each room lives on one node, and rooms never span nodes.
+  - The shared store (Valkey or Redis, through go-redis, which needs the
+    user's approval to download) holds the node registry, load, room
+    placement and tenants.
+  - Joins and API calls are routed to the room's node, and nodes drain for
+    upgrades.
 - **Same-origin WebSocket only** (gorilla default). The page is served by the
   SFU for this reason.
 - **API docs are hand-written** (OpenAPI for HTTP, AsyncAPI for WebSocket). The
@@ -104,7 +134,9 @@ transcoding. Single node, no auth yet.
 
 ## Known limitations
 
-- No authentication.
+- No control API or webhooks yet (Platform Track stages 2–3).
+- Single node (Platform Track stages 4–6).
+- Token revocation is not possible; keep tokens short-lived.
 - No TURN server.
 - No timeout for an unanswered subscriber offer.
 - About 30 s cleanup delay after a network drop (Pion ICE timeouts).
@@ -125,7 +157,8 @@ transcoding. Single node, no auth yet.
 | `52f8bdc` | Stage 6: `pkg/sfu`, integration tests, demo page, README |
 | `19ef4b2` | Controls stage A: track sources and stream IDs |
 | `a569b42` | Controls stage B (roster, mute, writer goroutine), API docs, stage C (page controls), this file |
-| (uncommitted) | Quality: strip RTP header extensions, camera and screen constraints and bitrates, quality overlay |
+| `b4d2775` | Quality: strip RTP header extensions, camera and screen constraints and bitrates, quality overlay |
+| (uncommitted) | CLAUDE.md Platform Track rules; Platform stage 1: tenants, join tokens, grants, dev mode |
 
 ## Working agreements (from the user)
 

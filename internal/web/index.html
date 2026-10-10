@@ -46,6 +46,7 @@
 <form id="join-form">
   <label>Room <input id="room" required pattern="[A-Za-z0-9_\-]{1,64}" value="room1"></label>
   <label>Your name <input id="name" required pattern="[A-Za-z0-9_\-]{1,64}" placeholder="alice"></label>
+  <label>Join token (optional) <input id="token" placeholder="empty = dev token" size="18"></label>
   <button type="submit" id="join" class="primary">Join</button>
 </form>
 <div id="status">Not connected. Names: letters, digits, "-" or "_".</div>
@@ -447,7 +448,18 @@ setInterval(() => {
 
 // ---------- join / leave ----------
 
+// getToken returns the pasted token, or asks the server's development
+// endpoint for one (only available when the server runs with -dev).
+async function getToken(room, name) {
+  const pasted = $("token").value.trim();
+  if (pasted) return pasted;
+  const resp = await fetch(`/dev/token?room=${encodeURIComponent(room)}&participant=${encodeURIComponent(name)}`);
+  if (!resp.ok) throw new Error("no join token: paste one, or run the server with -dev");
+  return (await resp.json()).token;
+}
+
 async function join(room, name) {
+  const token = await getToken(room, name);
   state.me = name;
   setStatus("Starting camera and microphone…");
   state.pub = newPC("publisher");
@@ -480,7 +492,7 @@ async function join(room, name) {
 
   const proto = location.protocol === "https:" ? "wss" : "ws";
   state.ws = new WebSocket(`${proto}://${location.host}/ws`);
-  state.ws.onopen = () => { setStatus("Joining…"); send({ type: "join", room, participant: name }); };
+  state.ws.onopen = () => { setStatus("Joining…"); send({ type: "join", token }); };
   state.ws.onmessage = (e) => {
     const msg = JSON.parse(e.data);
     state.messages = state.messages
@@ -491,7 +503,7 @@ async function join(room, name) {
   state.ws.onclose = () => { log("signaling closed"); cleanup("Disconnected."); };
 
   $("controls").classList.add("visible");
-  $("join").disabled = $("room").disabled = $("name").disabled = true;
+  $("join").disabled = $("room").disabled = $("name").disabled = $("token").disabled = true;
   updateControls();
 }
 
@@ -511,7 +523,7 @@ function cleanup(text) {
   $("people").replaceChildren();
   $("screens").replaceChildren();
   $("controls").classList.remove("visible");
-  $("join").disabled = $("room").disabled = $("name").disabled = false;
+  $("join").disabled = $("room").disabled = $("name").disabled = $("token").disabled = false;
   setStatus(text);
 }
 

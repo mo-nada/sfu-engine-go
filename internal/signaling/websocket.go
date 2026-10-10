@@ -12,9 +12,11 @@ import (
 	"github.com/gorilla/websocket"
 	"github.com/pion/webrtc/v4"
 
+	"github.com/mo-nada/sfu-engine/internal/auth"
 	"github.com/mo-nada/sfu-engine/internal/peer"
 	"github.com/mo-nada/sfu-engine/internal/room"
 	"github.com/mo-nada/sfu-engine/internal/sfu"
+	"github.com/mo-nada/sfu-engine/pkg/token"
 )
 
 const (
@@ -32,6 +34,7 @@ type Handler struct {
 	api      *webrtc.API
 	iceCfg   webrtc.Configuration
 	rooms    *room.Manager
+	tenants  *auth.Tenants
 	logger   *slog.Logger
 	upgrader websocket.Upgrader
 
@@ -40,13 +43,15 @@ type Handler struct {
 	closed   bool
 }
 
-// NewHandler creates a Handler. The upgrader keeps gorilla's default origin
-// check, so browsers may only connect from pages on the same host.
-func NewHandler(api *webrtc.API, iceCfg webrtc.Configuration, rooms *room.Manager, logger *slog.Logger) *Handler {
+// NewHandler creates a Handler. Joins must carry a token signed by one of
+// tenants. The upgrader keeps gorilla's default origin check, so browsers
+// may only connect from pages on the same host.
+func NewHandler(api *webrtc.API, iceCfg webrtc.Configuration, rooms *room.Manager, tenants *auth.Tenants, logger *slog.Logger) *Handler {
 	return &Handler{
 		api:      api,
 		iceCfg:   iceCfg,
 		rooms:    rooms,
+		tenants:  tenants,
 		logger:   logger,
 		sessions: make(map[*session]struct{}),
 	}
@@ -117,7 +122,8 @@ type session struct {
 
 	mu            sync.Mutex // guards the fields below, set once on join
 	joinLogger    *slog.Logger
-	roomID        string
+	grants        token.Grants
+	roomID        string // tenant-scoped room key: "<tenant>/<room>"
 	participantID string
 	publisher     *peer.Peer
 	subscriber    *peer.Peer
@@ -150,7 +156,7 @@ func (s *session) readLoop() {
 // handle processes one message. It returns false when the session must end.
 func (s *session) handle(msg Message) bool {
 	s.mu.Lock()
-	pub, sub, logger := s.publisher, s.subscriber, s.joinLogger
+	pub, sub, logger, grants := s.publisher, s.subscriber, s.joinLogger, s.grants
 	s.mu.Unlock()
 	joined := pub != nil
 
@@ -159,7 +165,7 @@ func (s *session) handle(msg Message) bool {
 			s.sendError("already joined")
 			return true
 		}
-		s.join(msg.Room, msg.Participant)
+		s.join(msg.Token)
 		return true
 	}
 	if !joined {
@@ -169,6 +175,10 @@ func (s *session) handle(msg Message) bool {
 
 	switch msg.Type {
 	case TypeOffer:
+		if !grants.Publish {
+			s.sendError("not allowed to publish")
+			return true
+		}
 		if len(msg.Tracks) > maxTracks {
 			s.sendError("too many tracks")
 			return true
@@ -227,14 +237,22 @@ func (s *session) handle(msg Message) bool {
 	return true
 }
 
-// join creates the participant's two peers, wires them to signaling and the
-// room's router, and sends the first subscriber offer.
-func (s *session) join(roomID, participantID string) {
-	if !validID.MatchString(roomID) || !validID.MatchString(participantID) {
-		s.sendError("room and participant must be 1-64 letters, digits, '-' or '_'")
+// join checks the token, creates the participant's two peers, wires them to
+// signaling and the room's router, and sends the first subscriber offer.
+//
+// The room, identity, tenant and permissions come only from the token. Rooms
+// are keyed by tenant, so equal room names of different tenants never meet.
+// The token is checked once, at join; a session outlives its token.
+func (s *session) join(tok string) {
+	tenant, claims, err := s.h.tenants.VerifyJoinToken(tok, time.Now())
+	if err != nil {
+		s.logger.Info("join rejected", "err", err) // the reason is logged, not told to the client
+		s.sendError("invalid token")
 		return
 	}
-	logger := s.logger.With("room_id", roomID, "participant_id", participantID)
+	roomName, participantID, grants := claims.Room, claims.Subject, claims.Grants
+	roomID := tenant.ID + "/" + roomName
+	logger := s.logger.With("tenant_id", tenant.ID, "room_id", roomName, "participant_id", participantID)
 
 	pub, err := peer.New(s.h.api, s.h.iceCfg, logger, participantID+"/pub")
 	if err != nil {
@@ -265,7 +283,7 @@ func (s *session) join(roomID, participantID string) {
 		s.send(Message{Type: TypeOffer, SDP: o.SDP})
 	})
 
-	notify := func(e room.Event) { s.send(eventMessage(roomID, participantID, e)) }
+	notify := func(e room.Event) { s.send(eventMessage(roomName, participantID, e)) }
 	r, err := s.h.rooms.Join(roomID, room.NewParticipant(participantID, pub, sub, notify))
 	if err != nil {
 		_ = pub.Close()
@@ -280,14 +298,30 @@ func (s *session) join(roomID, participantID string) {
 
 	s.mu.Lock()
 	s.joinLogger = logger
+	s.grants = grants
 	s.roomID, s.participantID = roomID, participantID
 	s.publisher, s.subscriber = pub, sub
 	s.mu.Unlock()
 
 	pub.OnTrack(func(remote *webrtc.TrackRemote, _ *webrtc.RTPReceiver) {
 		s.mu.Lock()
-		source := s.trackSources[remote.ID()]
+		source := sfu.NormalizeSource(s.trackSources[remote.ID()], remote.Kind())
 		s.mu.Unlock()
+		if !grants.AllowsSource(source) {
+			// Not forwarded. Keep reading and drop the packets, so Pion's
+			// buffers and RTCP keep working; the loop ends when the client
+			// removes the track or the peer closes.
+			logger.Info("track rejected by grants", "source", source)
+			s.sendError("not allowed to publish " + source)
+			go func() {
+				for {
+					if _, _, err := remote.ReadRTP(); err != nil {
+						return
+					}
+				}
+			}()
+			return
+		}
 		if err := r.Router().Publish(participantID, source, pub, remote); err != nil {
 			logger.Warn("publish failed", "err", err)
 		}
@@ -296,7 +330,9 @@ func (s *session) join(roomID, participantID string) {
 	// goroutine: OnClose may be called from inside session.close itself.
 	pub.OnClose(func() { go s.close() })
 	sub.OnClose(func() { go s.close() })
-	r.Router().AddSubscriber(participantID, sub)
+	if grants.Subscribe {
+		r.Router().AddSubscriber(participantID, sub)
+	}
 
 	// close may have run during the steps above. It reads the participant
 	// fields after marking the session closed, and we check the mark after all

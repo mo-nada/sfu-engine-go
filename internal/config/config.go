@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"strings"
 	"time"
+
+	"github.com/mo-nada/sfu-engine/internal/auth"
 )
 
 // Config holds all settings needed to run the SFU server.
@@ -21,6 +23,13 @@ type Config struct {
 	STUNURLs []string
 	// ShutdownTimeout bounds how long a graceful shutdown may take.
 	ShutdownTimeout time.Duration
+	// TenantsFile is a JSON file of tenants (see auth.LoadTenants).
+	TenantsFile string
+	// Tenants are added programmatically (for embedding and tests).
+	Tenants []auth.Tenant
+	// Dev adds a development tenant with a random secret and enables
+	// GET /dev/token, which gives a join token to anyone. Never use in production.
+	Dev bool
 }
 
 // Default returns a Config with sensible defaults.
@@ -45,6 +54,8 @@ func Load(args []string) (Config, error) {
 	fs.StringVar(&cfg.LogFormat, "log-format", cfg.LogFormat, "log format: text or json")
 	stun := fs.String("stun", strings.Join(cfg.STUNURLs, ","), "comma-separated STUN server URLs (empty to disable)")
 	fs.DurationVar(&cfg.ShutdownTimeout, "shutdown-timeout", cfg.ShutdownTimeout, "maximum time for graceful shutdown")
+	fs.StringVar(&cfg.TenantsFile, "tenants", "", "JSON file with tenants and their API keys and secrets")
+	fs.BoolVar(&cfg.Dev, "dev", false, "development mode: dev tenant and open /dev/token endpoint (never in production)")
 
 	if err := fs.Parse(args); err != nil {
 		return Config{}, err
@@ -77,6 +88,9 @@ func (c Config) Validate() error {
 		if !strings.HasPrefix(u, "stun:") && !strings.HasPrefix(u, "stuns:") {
 			errs = append(errs, fmt.Errorf("invalid STUN URL %q: must start with stun: or stuns:", u))
 		}
+	}
+	if c.TenantsFile == "" && len(c.Tenants) == 0 && !c.Dev {
+		errs = append(errs, errors.New("no tenants: pass -tenants FILE, or -dev for local development"))
 	}
 	if c.ShutdownTimeout <= 0 {
 		errs = append(errs, errors.New("shutdown timeout must be positive"))

@@ -2,10 +2,11 @@
 //
 // An Engine serves WebSocket signaling at /ws, a health check at /healthz and
 // a browser demo page at /. Clients join rooms over the signaling protocol
-// (see the README); every published track is forwarded to all other
-// participants in the same room.
+// (see the README) with a join token signed by a tenant (see package
+// token); every published track is forwarded to all other participants in
+// the same room. At least one tenant (or dev mode) is required.
 //
-//	eng, err := sfu.New(sfu.WithAddr(":8080"))
+//	eng, err := sfu.New(sfu.WithAddr(":8080"), sfu.WithTenantsFile("tenants.json"))
 //	if err != nil { ... }
 //	err = eng.Run(ctx) // blocks until ctx is cancelled, then shuts down
 package sfu
@@ -16,6 +17,7 @@ import (
 	"net"
 
 	"github.com/mo-nada/sfu-engine/internal/app"
+	"github.com/mo-nada/sfu-engine/internal/auth"
 	"github.com/mo-nada/sfu-engine/internal/config"
 )
 
@@ -44,6 +46,11 @@ func New(opts ...Option) (*Engine, error) {
 	cfg.Addr = o.addr
 	cfg.STUNURLs = o.stunURLs
 	cfg.ShutdownTimeout = o.shutdownTimeout
+	cfg.TenantsFile = o.tenantsFile
+	cfg.Dev = o.dev
+	for _, t := range o.tenants {
+		cfg.Tenants = append(cfg.Tenants, auth.Tenant{ID: t.ID, APIKey: t.APIKey, Secret: t.Secret})
+	}
 	if err := cfg.Validate(); err != nil {
 		return nil, err
 	}

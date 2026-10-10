@@ -3,6 +3,7 @@ package app
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -11,11 +12,13 @@ import (
 	"time"
 
 	apidocs "github.com/mo-nada/sfu-engine/api"
+	"github.com/mo-nada/sfu-engine/internal/auth"
 	"github.com/mo-nada/sfu-engine/internal/config"
 	"github.com/mo-nada/sfu-engine/internal/room"
 	"github.com/mo-nada/sfu-engine/internal/signaling"
 	"github.com/mo-nada/sfu-engine/internal/transport"
 	"github.com/mo-nada/sfu-engine/internal/web"
+	"github.com/mo-nada/sfu-engine/pkg/token"
 )
 
 // App is the running SFU server.
@@ -35,8 +38,28 @@ func New(cfg config.Config, logger *slog.Logger) (*App, error) {
 	if err != nil {
 		return nil, fmt.Errorf("webrtc api: %w", err)
 	}
+	list := append([]auth.Tenant(nil), cfg.Tenants...)
+	if cfg.TenantsFile != "" {
+		fromFile, err := auth.LoadTenants(cfg.TenantsFile)
+		if err != nil {
+			return nil, err
+		}
+		list = append(list, fromFile...)
+	}
+	var dev auth.Tenant
+	if cfg.Dev {
+		dev = auth.DevTenant()
+		list = append(list, dev)
+		logger.Warn("development mode: /dev/token gives join tokens to anyone; never use in production")
+	}
+	tenants, err := auth.NewTenants(list)
+	if err != nil {
+		return nil, fmt.Errorf("tenants: %w", err)
+	}
+	logger.Info("tenants loaded", "count", tenants.Len())
+
 	rooms := room.NewManager(logger)
-	sig := signaling.NewHandler(api, transport.Configuration(cfg.STUNURLs), rooms, logger)
+	sig := signaling.NewHandler(api, transport.Configuration(cfg.STUNURLs), rooms, tenants, logger)
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) {
@@ -44,6 +67,9 @@ func New(cfg config.Config, logger *slog.Logger) (*App, error) {
 		_, _ = w.Write([]byte("ok"))
 	})
 	mux.Handle("GET /ws", sig)
+	if cfg.Dev {
+		mux.Handle("GET /dev/token", devTokenHandler(dev))
+	}
 	mux.Handle("GET /{$}", web.Handler())
 	mux.Handle("GET /docs", web.Docs())
 	mux.Handle("GET /docs/signaling", web.SignalingDocs())
@@ -108,4 +134,20 @@ func (a *App) Serve(ctx context.Context, ln net.Listener) error {
 		return fmt.Errorf("http server: %w", err)
 	}
 	return nil
+}
+
+// devTokenHandler gives a one-hour join token with all permissions for
+// ?room=...&participant=..., signed for the dev tenant. Development only.
+func devTokenHandler(dev auth.Tenant) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		c := token.New(dev.APIKey, r.URL.Query().Get("participant"), r.URL.Query().Get("room"), time.Hour)
+		tok, err := token.Sign(dev.Secret, c)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Cache-Control", "no-store")
+		_ = json.NewEncoder(w).Encode(map[string]string{"token": tok})
+	})
 }
