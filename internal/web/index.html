@@ -538,6 +538,16 @@ $("join-form").addEventListener("submit", (e) => {
     cleanup("Could not start: " + err.message);
   });
 });
+// Direct links: ?room=standup&name=alice[&token=...] fill the form and join.
+{
+  const q = new URLSearchParams(location.search);
+  if (q.get("room")) $("room").value = q.get("room");
+  if (q.get("token")) $("token").value = q.get("token");
+  if (q.get("name")) {
+    $("name").value = q.get("name");
+    $("join-form").requestSubmit();
+  }
+}
 $("mic").addEventListener("click", guard(toggleMic));
 $("cam").addEventListener("click", guard(toggleCamera));
 $("screen").addEventListener("click", guard(toggleScreen));
