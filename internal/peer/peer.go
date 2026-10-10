@@ -218,6 +218,17 @@ func (p *Peer) RemoveTrack(sender *webrtc.RTPSender) error {
 	return nil
 }
 
+// CreateDataChannel creates a data channel. On a server-offered peer this
+// gives the first offer a media section, so ICE can connect before any track
+// is added.
+func (p *Peer) CreateDataChannel(label string) (*webrtc.DataChannel, error) {
+	dc, err := p.pc.CreateDataChannel(label, nil)
+	if err != nil {
+		return nil, fmt.Errorf("create data channel: %w", err)
+	}
+	return dc, nil
+}
+
 // WriteRTCP sends RTCP packets, for example a PLI keyframe request, to the client.
 func (p *Peer) WriteRTCP(pkts []rtcp.Packet) error {
 	return p.pc.WriteRTCP(pkts)

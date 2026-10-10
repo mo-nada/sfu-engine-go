@@ -39,7 +39,7 @@ func (m *Manager) Join(roomID string, p *Participant) (*Room, error) {
 
 	r, ok := m.rooms[roomID]
 	if !ok {
-		r = newRoom(roomID)
+		r = newRoom(roomID, m.logger)
 		m.rooms[roomID] = r
 		m.logger.Info("room created", "room_id", roomID)
 	}
@@ -69,6 +69,10 @@ func (m *Manager) Leave(roomID, participantID string) {
 	if p == nil {
 		return
 	}
+	r.router.RemoveSubscriber(participantID)
+	if remaining == 0 {
+		r.router.Close()
+	}
 	// Close outside the lock: closing peers can be slow, and peer callbacks may call Leave.
 	if err := p.Close(); err != nil {
 		m.logger.Warn("participant close error", "room_id", roomID, "participant_id", participantID, "err", err)
@@ -96,6 +100,7 @@ func (m *Manager) Close() {
 	m.mu.Unlock()
 
 	for id, r := range rooms {
+		r.router.Close()
 		for _, p := range r.removeAll() {
 			if err := p.Close(); err != nil {
 				m.logger.Warn("participant close error", "room_id", id, "participant_id", p.ID(), "err", err)

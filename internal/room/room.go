@@ -1,24 +1,36 @@
 package room
 
 import (
+	"log/slog"
 	"sync"
+
+	"github.com/mo-nada/sfu-engine/internal/sfu"
 )
 
 // Room is a group of participants that can exchange media.
-// Its membership is changed only through the Manager.
+// Its membership is changed only through the Manager. Each room owns one
+// Router that forwards media between its participants.
 type Room struct {
-	id string
+	id     string
+	router *sfu.Router
 
 	mu           sync.RWMutex
 	participants map[string]*Participant
 }
 
-func newRoom(id string) *Room {
-	return &Room{id: id, participants: make(map[string]*Participant)}
+func newRoom(id string, logger *slog.Logger) *Room {
+	return &Room{
+		id:           id,
+		router:       sfu.NewRouter(logger.With("room_id", id)),
+		participants: make(map[string]*Participant),
+	}
 }
 
 // ID returns the room identifier.
 func (r *Room) ID() string { return r.id }
+
+// Router returns the room's media router.
+func (r *Room) Router() *sfu.Router { return r.router }
 
 // Participant returns the participant with the given ID.
 func (r *Room) Participant(id string) (*Participant, bool) {
