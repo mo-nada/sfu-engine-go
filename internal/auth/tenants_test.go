@@ -2,6 +2,7 @@ package auth
 
 import (
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -89,5 +90,22 @@ func TestDevTenantIsValid(t *testing.T) {
 	}
 	if a.Secret == b.Secret {
 		t.Error("dev secrets are not random")
+	}
+}
+
+// Made-up API keys cannot grow memory without limit.
+func TestUnknownKeysCacheIsBounded(t *testing.T) {
+	tenants, _ := NewTenants(nil)
+	for i := range maxUnknown + 50 {
+		tok, _ := token.Sign(secretA, token.New(fmt.Sprintf("fake-%d", i), "a", "r", time.Minute))
+		if _, _, err := tenants.VerifyJoinToken(tok, time.Now()); err == nil {
+			t.Fatal("a made-up key was accepted")
+		}
+	}
+	tenants.mu.Lock()
+	n := len(tenants.unknown)
+	tenants.mu.Unlock()
+	if n > maxUnknown {
+		t.Errorf("unknown-key cache has %d entries, more than %d", n, maxUnknown)
 	}
 }

@@ -26,6 +26,10 @@ var (
 	ErrRoomNotFound = errors.New("room not found")
 	// ErrRoomFull is returned by Join when the room has MaxParticipants.
 	ErrRoomFull = errors.New("room is full")
+	// ErrRoomLimit is returned when the tenant's plan allows no more rooms.
+	ErrRoomLimit = errors.New("room limit reached")
+	// ErrParticipantLimit is returned when the tenant's plan allows no more participants.
+	ErrParticipantLimit = errors.New("participant limit reached")
 	// ErrServerMuted is returned by SetMuted when the client tries to unmute
 	// a source the server muted.
 	ErrServerMuted = errors.New("muted by the server")
@@ -40,6 +44,29 @@ type Manager struct {
 	rooms  map[string]*Room
 	closed bool
 	obs    Observer
+	// remote returns a tenant's rooms and participants on the other nodes.
+	remote func(tenantID string) (rooms, participants int)
+}
+
+// SetRemoteCounts sets where the tenant's counts on other nodes come from,
+// for plan limits. Call it before the Manager is used.
+func (m *Manager) SetRemoteCounts(f func(tenantID string) (rooms, participants int)) { m.remote = f }
+
+// tenantCounts returns the tenant's rooms and participants on all nodes.
+// m.mu must be held. This node's part is exact, so concurrent joins and
+// creates on one node can never pass a limit; other nodes' parts are a few
+// seconds old.
+func (m *Manager) tenantCounts(tenantID string) (rooms, participants int) {
+	if m.remote != nil {
+		rooms, participants = m.remote(tenantID)
+	}
+	for id, r := range m.rooms {
+		if t, _ := SplitRoomID(id); t == tenantID {
+			rooms++
+			participants += r.count()
+		}
+	}
+	return rooms, participants
 }
 
 // NewManager creates an empty Manager.
@@ -77,6 +104,16 @@ func (m *Manager) join(roomID string, p *Participant, create bool, opts Options)
 	r, ok := m.rooms[roomID]
 	if !ok && !create {
 		return nil, ErrRoomNotFound
+	}
+	if p.limits.MaxRooms > 0 || p.limits.MaxParticipants > 0 {
+		tenant, _ := SplitRoomID(roomID)
+		rooms, participants := m.tenantCounts(tenant)
+		if !ok && p.limits.MaxRooms > 0 && rooms >= p.limits.MaxRooms {
+			return nil, ErrRoomLimit
+		}
+		if p.limits.MaxParticipants > 0 && participants >= p.limits.MaxParticipants {
+			return nil, ErrParticipantLimit
+		}
 	}
 	newlyCreated := false
 	if !ok {
@@ -272,6 +309,12 @@ func (m *Manager) Create(roomID string, opts Options) (*Room, error) {
 	}
 	if _, ok := m.rooms[roomID]; ok {
 		return nil, ErrRoomExists
+	}
+	if opts.TenantMaxRooms > 0 {
+		tenant, _ := SplitRoomID(roomID)
+		if rooms, _ := m.tenantCounts(tenant); rooms >= opts.TenantMaxRooms {
+			return nil, ErrRoomLimit
+		}
 	}
 	r := m.newRoom(roomID, opts, true)
 	m.rooms[roomID] = r
@@ -556,6 +599,17 @@ func (m *Manager) Stats() Stats {
 		s.TenantParticipants[tenant] += n
 	}
 	return s
+}
+
+// RoomIDs lists the rooms on this node.
+func (m *Manager) RoomIDs() []string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	out := make([]string, 0, len(m.rooms))
+	for id := range m.rooms {
+		out = append(out, id)
+	}
+	return out
 }
 
 // HasRoom reports whether the room exists on this node.

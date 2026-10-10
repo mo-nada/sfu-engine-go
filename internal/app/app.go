@@ -129,18 +129,28 @@ func New(cfg config.Config, logger *slog.Logger) (*App, error) {
 	}
 
 	a.rooms = room.NewManager(logger)
-	a.cluster = cluster.New(a.clStore, nodeID, cfg.NodeURL, func() cluster.Load {
-		s := a.rooms.Stats()
-		return cluster.Load{Rooms: s.Rooms, Participants: s.Participants, TenantRooms: s.TenantRooms, TenantParticipants: s.TenantParticipants}
+	a.cluster = cluster.New(a.clStore, nodeID, cfg.NodeURL, cluster.Hooks{
+		Load: func() cluster.Load {
+			s := a.rooms.Stats()
+			return cluster.Load{Rooms: s.Rooms, Participants: s.Participants, TenantRooms: s.TenantRooms, TenantParticipants: s.TenantParticipants}
+		},
+		Rooms: a.rooms.RoomIDs,
+		// Another node owns the room now: close this copy; its participants
+		// reconnect and are forwarded to the owner.
+		Lost: func(roomID string) { _ = a.rooms.Delete(roomID, "room moved to another node, reconnect") },
 	}, logger)
+	a.rooms.SetRemoteCounts(a.cluster.RemoteTenantCounts)
+	if cfg.HeartbeatInterval > 0 && cfg.HeartbeatTTL > 0 {
+		a.cluster.SetTiming(cfg.HeartbeatInterval, cfg.HeartbeatTTL)
+	}
 	a.meter = usage.NewMeter(a.store, logger, usage.DefaultInterval)
 	a.webhooks = webhook.NewDispatcher(a.store, logger)
 	a.rooms.SetObserver(room.Observers{a.meter, a.webhooks, releaseOnFinish{c: a.cluster}})
 
 	a.signaling = signaling.NewHandler(api, transport.Configuration(cfg.STUNURLs), a.rooms, tenants, logger)
-	a.signaling.SetPlatform(joinRouting{c: a.cluster, rooms: a.rooms}, a.cluster)
+	a.signaling.SetRouting(joinRouting{c: a.cluster, rooms: a.rooms})
 	apiServer := serverapi.NewServer(tenants, serverapi.LocalRooms{Manager: a.rooms}, logger)
-	apiServer.SetPlatform(a.cluster, a.cluster)
+	apiServer.SetCluster(a.cluster)
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) {
@@ -285,6 +295,19 @@ func (j joinRouting) RouteJoin(ctx context.Context, roomID string, autoCreate, r
 	}
 	switch {
 	case id == j.c.ID():
+		if !j.rooms.HasRoom(roomID) && autoCreate {
+			// A new copy of the room: claim it again with a new generation,
+			// so a late release of the old copy cannot remove this claim.
+			if id, url, err = j.c.ClaimSelf(ctx, roomID); err != nil {
+				return "", err
+			}
+			if id != j.c.ID() {
+				if routed {
+					return "", errRoomElsewhere
+				}
+				return url, nil
+			}
+		}
 		return "", nil
 	case id != "":
 		if routed {

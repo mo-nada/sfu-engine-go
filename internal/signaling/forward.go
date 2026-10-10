@@ -25,12 +25,6 @@ type Routing interface {
 	Release(roomID string)
 }
 
-// Quota counts a tenant's rooms and participants across all nodes.
-type Quota interface {
-	TenantRooms(tenantID string) int
-	TenantParticipants(tenantID string) int
-}
-
 func (s *session) upstreamConn() *websocket.Conn {
 	s.upstreamMu.Lock()
 	defer s.upstreamMu.Unlock()
@@ -52,6 +46,10 @@ func (s *session) forward(baseURL, tok string, logger *slog.Logger) {
 		return
 	}
 	up.SetReadLimit(maxMessageSize)
+	// The session's ping loop also pings the room's node; a node that stops
+	// answering is noticed within pongTimeout.
+	_ = up.SetReadDeadline(time.Now().Add(pongTimeout))
+	up.SetPongHandler(func(string) error { return up.SetReadDeadline(time.Now().Add(pongTimeout)) })
 	join, _ := encodeJoin(tok)
 	if err := up.WriteMessage(websocket.TextMessage, join); err != nil {
 		_ = up.Close()

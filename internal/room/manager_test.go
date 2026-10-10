@@ -6,6 +6,7 @@ import (
 	"io"
 	"log/slog"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -426,5 +427,32 @@ func TestServerChangesSurviveRejoin(t *testing.T) {
 	}
 	if !sawGrants || !sawMute {
 		t.Errorf("rejoined alice was not told: grants=%v mute=%v", sawGrants, sawMute)
+	}
+}
+
+// Many joins at the same moment on one node never pass a limit.
+func TestLimitsHoldUnderConcurrency(t *testing.T) {
+	m := NewManager(discardLogger())
+	m.SetRemoteCounts(func(string) (int, int) { return 1, 2 }) // another node has 1 room, 2 people
+	var wg sync.WaitGroup
+	var ok atomic.Int32
+	for i := range 50 {
+		wg.Go(func() {
+			p := NewParticipant(fmt.Sprintf("p%d", i), nil, nil, nil)
+			p.SetLimits(Limits{MaxRooms: 3, MaxParticipants: 10})
+			if _, err := m.Join(fmt.Sprintf("acme/r%d", i%5), p); err == nil {
+				ok.Add(1)
+			} else if !errors.Is(err, ErrRoomLimit) && !errors.Is(err, ErrParticipantLimit) {
+				t.Errorf("unexpected error: %v", err)
+			}
+		})
+	}
+	wg.Wait()
+	s := m.Stats()
+	if s.TenantRooms["acme"] > 2 || s.TenantParticipants["acme"] > 8 || int(ok.Load()) != s.Participants {
+		t.Errorf("limits passed: %d rooms (max 2 here), %d participants (max 8 here), %d joins ok", s.TenantRooms["acme"], s.TenantParticipants["acme"], ok.Load())
+	}
+	if _, err := m.Create("acme/explicit", Options{TenantMaxRooms: 3}); !errors.Is(err, ErrRoomLimit) {
+		t.Errorf("Create over the limit: err = %v", err)
 	}
 }

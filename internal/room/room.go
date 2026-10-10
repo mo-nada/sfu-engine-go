@@ -37,6 +37,16 @@ type Options struct {
 	MaxParticipants int
 	// EmptyTimeout is how long an explicit room stays open with nobody in it.
 	EmptyTimeout time.Duration
+	// TenantMaxRooms limits the tenant's rooms (on all nodes) when this room
+	// is created; 0 means no limit.
+	TenantMaxRooms int
+}
+
+// Limits are a tenant's plan limits checked when a participant joins; 0
+// means no limit. Counts include the other nodes (see Manager.SetRemoteCounts).
+type Limits struct {
+	MaxRooms        int // when the join creates the room
+	MaxParticipants int
 }
 
 // newRoom creates a room whose router reports track events to m's observer.

@@ -1,0 +1,24 @@
+{
+  "name": "sfu-engine-sdks",
+  "private": true,
+  "workspaces": [
+    "packages/client",
+    "packages/server",
+    "packages/react"
+  ],
+  "scripts": {
+    "build": "npm run build -w @sfu-engine/client -w @sfu-engine/server -w @sfu-engine/react",
+    "test": "vitest run",
+    "typecheck": "tsc -p packages/client && tsc -p packages/server && tsc -p packages/react"
+  },
+  "devDependencies": {
+    "@types/react": "^19.3.0",
+    "@types/react-dom": "^19.3.0",
+    "react": "^19.3.0",
+    "react-dom": "^19.3.0",
+    "tsup": "^8.5.1",
+    "typescript": "^7.0.2",
+    "vitest": "^5.0.3"
+  },
+  "type": "module"
+}

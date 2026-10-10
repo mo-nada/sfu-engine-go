@@ -1,0 +1,18 @@
+# Databases for local development and the multi-node setup:
+#   docker compose up -d
+# PostgreSQL keeps tenants, API keys and usage; Valkey (Redis-compatible)
+# keeps the cluster state (nodes, room placement).
+services:
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: sfu
+      POSTGRES_PASSWORD: sfu
+      POSTGRES_DB: sfu
+    ports: ["5432:5432"]
+    volumes: [postgres-data:/var/lib/postgresql/data]
+  valkey:
+    image: valkey/valkey:9
+    ports: ["6379:6379"]
+volumes:
+  postgres-data:

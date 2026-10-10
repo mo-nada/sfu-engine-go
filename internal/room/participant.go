@@ -29,7 +29,11 @@ type Participant struct {
 	muted       map[string]bool // source -> muted (as everyone sees it)
 	serverMuted map[string]bool // source -> muted by the server
 	grants      token.Grants
+	limits      Limits
 }
+
+// SetLimits sets the tenant's plan limits checked when p joins.
+func (p *Participant) SetLimits(l Limits) { p.limits = l }
 
 // NewParticipant creates a participant. Either peer may be nil if it has not
 // been created yet. notify receives room events and may be nil.

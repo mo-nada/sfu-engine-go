@@ -40,17 +40,20 @@ type Handler struct {
 	upgrader websocket.Upgrader
 
 	routing Routing // nil: everything is handled on this node
-	quota   Quota   // nil: no tenant limits
 
 	mu       sync.Mutex
 	sessions map[*session]struct{}
 	closed   bool
 }
 
-// SetPlatform enables multi-node routing and tenant limits. Call it before
-// serving.
-func (h *Handler) SetPlatform(routing Routing, quota Quota) {
-	h.routing, h.quota = routing, quota
+// SetRouting enables multi-node routing. Call it before serving.
+func (h *Handler) SetRouting(routing Routing) { h.routing = routing }
+
+// participantJoined reports whether the session joined a room.
+func (s *session) participantJoined() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.participant != nil
 }
 
 // NewHandler creates a Handler. Joins must carry a token signed by one of
@@ -299,22 +302,22 @@ func (s *session) join(tok string) {
 			s.forward(forwardURL, tok, logger)
 			return
 		}
+		// RouteJoin may have claimed the room for this node: give the claim
+		// back on every path where the join does not succeed.
+		joined := false
+		defer func() {
+			if !joined {
+				s.h.routing.Release(roomID)
+			}
+		}()
+		defer func() { joined = s.participantJoined() }()
 	}
 
-	// Tenant limits (counted across all nodes; a burst of joins can pass a
-	// limit by a few, because the counts are a few seconds old).
-	var opts room.Options
-	if q := s.h.quota; q != nil {
-		lim := tenant.Limits
-		if lim.MaxParticipants > 0 && q.TenantParticipants(tenant.ID) >= lim.MaxParticipants {
-			s.sendError("participant limit reached")
-			return
-		}
-		if tenant.AutoCreateRooms && !s.h.rooms.HasRoom(roomID) && lim.MaxRooms > 0 && q.TenantRooms(tenant.ID) >= lim.MaxRooms {
-			s.sendError("room limit reached")
-			return
-		}
-		opts.MaxParticipants = lim.MaxRoomSize
+	// Plan limits are checked by the room manager under its lock.
+	opts := room.Options{MaxParticipants: tenant.Limits.MaxRoomSize}
+	limits := room.Limits{MaxParticipants: tenant.Limits.MaxParticipants}
+	if tenant.AutoCreateRooms {
+		limits.MaxRooms = tenant.Limits.MaxRooms
 	}
 
 	pub, err := peer.New(s.h.api, s.h.iceCfg, logger, participantID+"/pub")
@@ -354,6 +357,7 @@ func (s *session) join(tok string) {
 	}
 	participant := room.NewParticipant(participantID, pub, sub, notify)
 	participant.SetGrants(grants)
+	participant.SetLimits(limits)
 	join := s.h.rooms.JoinExisting
 	if tenant.AutoCreateRooms {
 		join = func(id string, p *room.Participant) (*room.Room, error) { return s.h.rooms.JoinOrCreate(id, p, opts) }
@@ -362,9 +366,6 @@ func (s *session) join(tok string) {
 	if err != nil {
 		_ = pub.Close()
 		_ = sub.Close()
-		if s.h.routing != nil {
-			s.h.routing.Release(roomID)
-		}
 		switch {
 		case errors.Is(err, room.ErrDuplicateParticipant):
 			s.sendError("participant already in room")
@@ -372,6 +373,10 @@ func (s *session) join(tok string) {
 			s.sendError("room is full")
 		case errors.Is(err, room.ErrRoomNotFound):
 			s.sendError("room not found")
+		case errors.Is(err, room.ErrRoomLimit):
+			s.sendError("room limit reached")
+		case errors.Is(err, room.ErrParticipantLimit):
+			s.sendError("participant limit reached")
 		default:
 			s.failJoin(logger, err)
 		}
@@ -504,6 +509,12 @@ func (s *session) pingLoop() {
 			if err := s.conn.WriteControl(websocket.PingMessage, nil, time.Now().Add(writeTimeout)); err != nil {
 				go s.close()
 				return
+			}
+			if up := s.upstreamConn(); up != nil {
+				if err := up.WriteControl(websocket.PingMessage, nil, time.Now().Add(writeTimeout)); err != nil {
+					go s.close()
+					return
+				}
 			}
 		}
 	}

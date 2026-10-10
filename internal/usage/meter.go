@@ -74,10 +74,16 @@ func (m *Meter) ParticipantLeft(roomID, participantID string, _ time.Time) {
 	}
 }
 
-// countLocked moves seg's time up to now into pending. m.mu must be held.
+// countLocked moves seg's time up to now into pending, split at UTC
+// midnight so every day gets exactly its own time. m.mu must be held.
 func (m *Meter) countLocked(seg *segment, now time.Time) {
-	if d := now.Sub(seg.since); d > 0 {
-		m.pending[pendingKey{seg.tenant, store.Day(now)}] += d
+	for t := seg.since; t.Before(now); {
+		end := store.Day(t).Add(24 * time.Hour) // next midnight
+		if end.After(now) {
+			end = now
+		}
+		m.pending[pendingKey{seg.tenant, store.Day(t)}] += end.Sub(t)
+		t = end
 	}
 	seg.since = now
 }
@@ -107,10 +113,22 @@ func (m *Meter) Flush() {
 		m.countLocked(seg, now)
 	}
 	batch := make(map[pendingKey]int64)
+	today := store.Day(now)
 	for k, d := range m.pending {
+		if k.day.Before(today) {
+			// A finished day: write it all (rounded to the nearest second).
+			if sec := int64((d + time.Second/2) / time.Second); sec > 0 {
+				batch[k] = sec
+			}
+			delete(m.pending, k)
+			continue
+		}
 		if sec := int64(d / time.Second); sec > 0 {
 			batch[k] = sec
 			m.pending[k] = d - time.Duration(sec)*time.Second
+		}
+		if m.pending[k] == 0 {
+			delete(m.pending, k)
 		}
 	}
 	m.mu.Unlock()

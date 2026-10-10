@@ -16,6 +16,36 @@ type options struct {
 	tenantsFile     string
 	tenants         []Tenant
 	dev             bool
+	databaseURL     string
+	redisURL        string
+	adminSecret     string
+	nodeID, nodeURL string
+	drainTimeout    time.Duration
+}
+
+// WithDatabase stores tenants, API keys and usage in PostgreSQL, for example
+// "postgres://user:pass@db:5432/sfu". Without it they are kept in memory.
+func WithDatabase(url string) Option {
+	return func(o *options) { o.databaseURL = url }
+}
+
+// WithCluster joins a cluster of nodes that share a Redis or Valkey server
+// ("redis://host:6379/0"). nodeID names this node; nodeURL is the base URL
+// the other nodes use to reach it (for example http://10.0.0.5:8080).
+func WithCluster(redisURL, nodeID, nodeURL string) Option {
+	return func(o *options) { o.redisURL, o.nodeID, o.nodeURL = redisURL, nodeID, nodeURL }
+}
+
+// WithAdminSecret enables the operator admin API at /admin/v1 (secret of at
+// least 32 bytes).
+func WithAdminSecret(secret string) Option {
+	return func(o *options) { o.adminSecret = secret }
+}
+
+// WithDrainTimeout makes shutdown wait up to d for rooms to empty, while the
+// node takes no new rooms.
+func WithDrainTimeout(d time.Duration) Option {
+	return func(o *options) { o.drainTimeout = d }
 }
 
 // Tenant is a customer system allowed to use the engine. Its backend signs
@@ -27,6 +57,10 @@ type Tenant struct {
 	// AutoCreateRooms lets a join create a missing room. When false, rooms
 	// must be created through the server API first.
 	AutoCreateRooms bool
+	// Limits caps the tenant's usage; zero values mean no limit.
+	MaxRooms, MaxParticipants, MaxRoomSize int
+	// WebhookURL receives signed room events; WebhookSecret signs them.
+	WebhookURL, WebhookSecret string
 }
 
 // WithTenant adds a tenant. Can be used several times.

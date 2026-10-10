@@ -6,9 +6,19 @@ An open-source WebRTC **SFU** (Selective Forwarding Unit) written in Go on top o
 An SFU receives each participant's encoded media once and forwards the RTP packets
 to the other participants in the same room, without decoding or re-encoding.
 
-**Status: Phase 1 (core media engine).** Two or more participants can join a room
-over WebSocket signaling, publish video, and receive everyone else's video through
-the SFU. It is a working minimal SFU, not a production-ready platform yet. See
+**Status:** a multi-tenant video platform service, like LiveKit:
+
+- **Customers (tenants)** get API keys and use the **server API** to create
+  rooms, issue join tokens and control participants.
+- **Their apps** join rooms over WebSocket signaling and WebRTC: camera,
+  microphone and screen share.
+- **You, the operator,** manage customers, keys, plan limits and usage
+  through the **admin API**.
+- It **scales horizontally**: each room lives on one node, and any node can be
+  called.
+
+It has been tested with real browsers on one machine, and with Go test
+clients on one or two nodes. It has not been load-tested yet. See
 [Known limitations](#known-limitations).
 
 ## Quick start
@@ -31,6 +41,23 @@ the microphone and camera on and off, shares your screen, and switches devices.
 The browser only allows camera access on `localhost` or over HTTPS. To test from
 another machine, put the server behind HTTPS (for example, a reverse proxy).
 
+## Platform mode: database, cluster store and admin API
+
+```bash
+docker compose up -d                 # PostgreSQL :5432 and Valkey :6379
+export SFU_DATABASE_URL=postgres://sfu:sfu@localhost:5432/sfu
+export SFU_REDIS_URL=redis://localhost:6379/0
+export SFU_ADMIN_SECRET=change-me-admin-secret-at-least-32-chars
+go run ./cmd/sfu -dev -stun ""
+```
+
+- **PostgreSQL** keeps tenants, API keys and usage, so all nodes share them and
+  they survive restarts.
+- **Valkey** (or Redis) keeps the cluster state.
+- The admin secret turns on the admin API.
+
+**Two nodes on one machine** (ports 8081 and 8082): run `scripts/run-cluster.sh`.
+
 ## Command-line flags
 
 | Flag | Default | Meaning |
@@ -42,8 +69,14 @@ another machine, put the server behind HTTPS (for example, a reverse proxy).
 | `-shutdown-timeout` | `10s` | Maximum time for graceful shutdown |
 | `-tenants` | none | JSON file with tenants (see `tenants.example.json`) |
 | `-dev` | off | Development tenant and open `/dev/token` endpoint. Never in production |
+| `-database-url` | env `SFU_DATABASE_URL` | PostgreSQL for tenants, keys and usage. Empty keeps them in memory |
+| `-redis-url` | env `SFU_REDIS_URL` | Redis/Valkey shared by all nodes. Empty means one node |
+| `-admin-secret` | env `SFU_ADMIN_SECRET` | Enables the admin API (at least 32 bytes). Prefer the env variable |
+| `-node-id` | env `SFU_NODE_ID`, or host name + random | This node's name in the cluster |
+| `-node-url` | env `SFU_NODE_URL`, or `http://127.0.0.1:<port>` | URL the other nodes use to reach this node |
+| `-drain-timeout` | `0` | On shutdown, take no new rooms and wait this long for rooms to empty |
 
-The server needs `-tenants` or `-dev` to start.
+The server needs `-tenants`, `-database-url`, `-admin-secret` or `-dev` to start.
 
 Set `NO_COLOR=1` to disable colored logs.
 
@@ -55,6 +88,8 @@ Set `NO_COLOR=1` to disable colored logs.
 | `GET /ws` | WebSocket signaling |
 | `GET /healthz` | Health check, returns `200 ok` |
 | `GET /dev/token?room=&participant=` | Development join token (only with `-dev`) |
+| `/v1/...` | Server API for tenants' backends |
+| `/admin/v1/...` | Admin API for the operator (only with an admin secret) |
 | `GET /docs` | HTTP API documentation (Swagger UI) |
 | `GET /docs/signaling` | Signaling protocol documentation (AsyncAPI viewer) |
 | `GET /api/openapi.yaml` | OpenAPI 3.1 document for the HTTP endpoints |
@@ -127,6 +162,129 @@ A tenant never sees another tenant's rooms: they answer `404`.
 By default, a join only works for a room created with `POST /v1/rooms`. That way
 room limits always apply, and a closed room stays closed. A tenant with
 `"auto_create_rooms": true` lets joins create rooms (the `-dev` tenant does).
+
+## Admin API (`/admin/v1`), for the operator
+
+Every request carries `Authorization: Bearer $SFU_ADMIN_SECRET`.
+
+| Method | Path | Does |
+|---|---|---|
+| `POST` | `/admin/v1/tenants` | Create a customer `{id, name, auto_create_rooms, webhook_url, limits}`. Returns its first `api_key` and `api_secret`, and its `webhook_secret`; these are shown only once |
+| `GET` | `/admin/v1/tenants` | List customers |
+| `GET` / `PATCH` | `/admin/v1/tenants/{id}` | Read or change a customer: name, limits, webhook, `disabled`, `rotate_webhook_secret` |
+| `POST` / `GET` | `/admin/v1/tenants/{id}/keys` | Create another key (for rotation), or list keys (without secrets) |
+| `DELETE` | `/admin/v1/tenants/{id}/keys/{key}` | Revoke a key |
+| `GET` | `/admin/v1/tenants/{id}/usage?from=2026-10-01&to=2026-10-31` | Participant-minutes per day, for billing |
+
+**Limits** (`limits` object; 0 means no limit):
+
+- `max_rooms`: concurrent rooms.
+- `max_participants`: concurrent participants in all rooms together.
+- `max_room_size`: participants in one room.
+
+Limits are counted across all nodes. Changes to keys and customers reach every
+node within 10 seconds.
+
+**Usage** counts every participant's connected time per customer and UTC day. It
+is written every minute.
+
+## Webhooks
+
+If a customer has a `webhook_url`, every node sends it signed JSON events:
+`room_started`, `room_finished`, `participant_joined`, `participant_left` (with
+`duration_seconds`), `track_published` and `track_unpublished`.
+
+The headers are:
+
+- `X-SFU-Event`: the event name.
+- `X-SFU-Signature: t=<unix>,v1=<hex HMAC-SHA256(webhook_secret, "<t>.<raw body>")>`.
+
+Check the signature and reject old timestamps. A non-2xx answer is retried up to
+3 times. The full format is in the `webhooks` section of `api/openapi.yaml`.
+
+## Running several nodes
+
+```
+clients ──► any node ──(forwards the WebSocket and API calls)──► node that owns the room
+                         │                                          ▲
+                         └─ PostgreSQL (tenants, keys, usage)       │ WebRTC media goes
+                            Valkey (nodes, room placement)          │ straight to this node
+```
+
+- Each node sends a heartbeat (with its load) to Valkey every 2 seconds. A node
+  without a heartbeat for 6 seconds is gone.
+- **A room lives on exactly one node.** The first node to claim it in Valkey owns
+  it. A claim of a node that is gone can be taken over.
+- **New rooms** go to the node with the fewest participants. Draining nodes are
+  skipped.
+- **A join or API call reaching another node** is forwarded to the owner. Media
+  never passes through the forwarding node: ICE candidates come from the owner,
+  so clients connect to it directly.
+- **Upgrades:** start the node with `-drain-timeout 5m`. On SIGTERM it takes no
+  new rooms and waits for its rooms to empty.
+- Every node must reach the others at its `-node-url`. Clients must reach each
+  node's media ports.
+
+## SDKs
+
+Customers build on the SDKs, not on the raw protocol.
+
+| Package | For | Location |
+|---|---|---|
+| `@sfu-engine/client` | Browsers: join a room, camera, microphone, screen share, devices, events, auto-reconnect | `sdks/js/packages/client` |
+| `@sfu-engine/react` | React and Next.js: `<LiveRoom>`, hooks, `<VideoConference>` and other components | `sdks/js/packages/react` |
+| `@sfu-engine/server` | Node, Next.js, edge runtimes: join tokens, room control, webhooks, admin API | `sdks/js/packages/server` |
+| `pkg/sfuapi` + `pkg/token` | Go backends: the same server-side features | this module |
+
+**Backend** (for example a Next.js route): create the room and a join token.
+
+```ts
+import { AccessToken, RoomServiceClient } from "@sfu-engine/server";
+
+const rooms = new RoomServiceClient(SFU_URL, API_KEY, API_SECRET);
+await rooms.createRoom({ name: "standup", maxParticipants: 10 }).catch(() => {}); // exists: fine
+const token = await new AccessToken(API_KEY, API_SECRET, { identity: "alice" })
+  .addGrant({ room: "standup", publish: true, subscribe: true })
+  .toJwt();
+```
+
+**Frontend:** a complete call in React.
+
+```tsx
+import { LiveRoom, VideoConference } from "@sfu-engine/react";
+
+<LiveRoom serverUrl={SFU_URL} token={token}>
+  <VideoConference />
+</LiveRoom>
+```
+
+**Frontend without React:**
+
+```ts
+import { Room } from "@sfu-engine/client";
+
+const room = new Room();
+room.on("trackSubscribed", (track, participant) => attachToVideo(track.stream, participant.identity));
+await room.connect(SFU_URL, token);
+await room.localParticipant.setCameraEnabled(true);
+await room.localParticipant.setMicrophoneEnabled(true);
+await room.localParticipant.setScreenShareEnabled(true);
+```
+
+**Webhooks** (Node): `await new WebhookReceiver(webhookSecret).receive(rawBody, req.headers["x-sfu-signature"])`.
+In Go: `sfuapi.WebhookHandler(secret, func(ev sfuapi.WebhookEvent) { ... })`.
+
+**Building and testing the JS SDKs:**
+
+```bash
+cd sdks/js
+npm install
+npm run build
+npm test
+```
+
+A full Next.js example is in `sdks/js/examples/nextjs`. It is not installed by
+`npm install`: see its README.
 
 ## Embedding in a Go application
 
@@ -214,6 +372,14 @@ internal/peer        one PeerConnection: negotiation, ICE queueing, close
 internal/sfu         Router: forwards published tracks to subscribers
 internal/transport   Pion API (codecs, interceptors) and ICE config
 internal/web         embedded browser pages: demo client and API doc viewers
+internal/auth        join and API token checks against tenants/keys (cached 10 s)
+internal/api         server API /v1 (rooms, participants, tokens), cluster routing
+internal/admin       operator API /admin/v1 (tenants, keys, limits, usage)
+internal/store       PostgreSQL / memory: tenants, keys, usage
+internal/cluster     Valkey / memory: node heartbeats, room placement, quotas
+internal/usage       participant-time metering for billing
+internal/webhook     signed webhook delivery with retries
+pkg/token            public: create and verify join and API tokens
 api                  OpenAPI and AsyncAPI documents (embedded and served)
 tests/integration    real clients against the real server
 ```
@@ -239,7 +405,10 @@ Keyframe requests from subscribers are passed on to the publisher.
 ## Testing
 
 ```bash
-go test -race ./...                       # all unit and integration tests
+go test -race ./...                       # all unit and integration tests (in-memory stores)
+# also against real PostgreSQL and Valkey (use a separate Redis database):
+SFU_TEST_DATABASE_URL=postgres://sfu:sfu@localhost:5432/sfu \
+SFU_TEST_REDIS_URL=redis://localhost:6379/15 go test -race ./...
 go test -race -v ./tests/integration/     # end-to-end: real clients, real server
 go vet ./...
 ```
@@ -253,7 +422,15 @@ isolation, disconnect cleanup, and duplicate names.
 
 These are planned for later phases:
 
-- **No SDKs, webhooks or admin API yet**; these come in the next Platform Track stages.
+- **SDKs are not published to npm yet.** Use them from `sdks/js` (build first).
+- **The Next.js example has not been run here:** `next` is not installed.
+- **Not load-tested.** A room is limited by one node's capacity.
+- **Limits are approximate under bursts.** Counts are a few seconds old, so a
+  burst of joins can pass a limit by a few.
+- **When a node dies, its rooms are lost.** Participants must reconnect; the room
+  is then placed on a live node.
+- **Secrets are stored in plain text** in PostgreSQL (API key secrets, webhook
+  secrets). Protect the database.
 - **Single node.** Horizontal scaling comes in the next Platform Track stages.
 - **Same-origin browsers only.** A web page served from another host cannot
   connect to `/ws`. Non-browser clients are not affected.

@@ -57,7 +57,8 @@ func TestMeterSplitsByDay(t *testing.T) {
 	m.Close()
 
 	days, _ := st.Usage(context.Background(), "acme", time.Date(2026, 3, 1, 0, 0, 0, 0, time.UTC), time.Date(2026, 3, 2, 0, 0, 0, 0, time.UTC))
-	if len(days) != 2 || days[0].ParticipantSeconds != 30 || days[1].ParticipantSeconds != 60 {
-		t.Errorf("usage = %+v, want 30 s then 60 s", days)
+	// 23:59:00-00:00:00 is March 1 (60 s); 00:00:00-00:00:30 is March 2 (30 s).
+	if len(days) != 2 || days[0].ParticipantSeconds != 60 || days[1].ParticipantSeconds != 30 {
+		t.Errorf("usage = %+v, want 60 s on March 1 and 30 s on March 2", days)
 	}
 }

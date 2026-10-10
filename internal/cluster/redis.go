@@ -16,7 +16,7 @@ import (
 //
 //	sfu:node:<id>   JSON NodeInfo, with the heartbeat TTL
 //	sfu:nodes       set of node IDs (members whose key expired are pruned)
-//	sfu:room:<room> owner node ID
+//	sfu:room:<room> owner claim "<node>|<generation>", with a TTL the owner renews
 type RedisStore struct {
 	rdb *redis.Client
 }
@@ -27,16 +27,28 @@ const (
 	roomKeyPrefix = "sfu:room:"
 )
 
-// claimScript sets the owner if there is none or the owner's node key is gone.
+// claimScript sets the claim ARGV[1] (node ARGV[3]) if there is none, the
+// owner's node key is gone, or the owner is the same node. ARGV[4] is the TTL
+// in milliseconds.
 var claimScript = redis.NewScript(`
 local cur = redis.call('GET', KEYS[1])
-if (not cur) or redis.call('EXISTS', ARGV[2] .. cur) == 0 then
-	redis.call('SET', KEYS[1], ARGV[1])
-	return ARGV[1]
+if cur then
+	local node = string.match(cur, '^(.*)|[^|]*$') or cur
+	if node ~= ARGV[3] and redis.call('EXISTS', ARGV[2] .. node) == 1 then
+		return cur
+	end
 end
-return cur`)
+redis.call('SET', KEYS[1], ARGV[1], 'PX', ARGV[4])
+return ARGV[1]`)
 
-// releaseScript deletes the claim only if ARGV[1] owns it.
+// renewScript extends the TTL only if the claim is still ARGV[1].
+var renewScript = redis.NewScript(`
+if redis.call('GET', KEYS[1]) == ARGV[1] then
+	return redis.call('PEXPIRE', KEYS[1], ARGV[2])
+end
+return 0`)
+
+// releaseScript deletes the claim only if it is still ARGV[1].
 var releaseScript = redis.NewScript(`
 if redis.call('GET', KEYS[1]) == ARGV[1] then
 	return redis.call('DEL', KEYS[1])
@@ -105,20 +117,33 @@ func (r *RedisStore) Nodes(ctx context.Context) ([]NodeInfo, error) {
 	return out, nil
 }
 
-func (r *RedisStore) ClaimRoom(ctx context.Context, roomID, nodeID string) (string, error) {
-	return claimScript.Run(ctx, r.rdb, []string{roomKeyPrefix + roomID}, nodeID, nodeKeyPrefix).Text()
+func (r *RedisStore) ClaimRoom(ctx context.Context, roomID string, claim Claim, ttl time.Duration) (Claim, error) {
+	v, err := claimScript.Run(ctx, r.rdb, []string{roomKeyPrefix + roomID},
+		claim.encode(), nodeKeyPrefix, claim.Node, ttl.Milliseconds()).Text()
+	if err != nil {
+		return Claim{}, err
+	}
+	return decodeClaim(v), nil
 }
 
-func (r *RedisStore) RoomOwner(ctx context.Context, roomID string) (string, error) {
+func (r *RedisStore) RoomOwner(ctx context.Context, roomID string) (Claim, error) {
 	v, err := r.rdb.Get(ctx, roomKeyPrefix+roomID).Result()
 	if errors.Is(err, redis.Nil) {
-		return "", nil
+		return Claim{}, nil
 	}
-	return v, err
+	if err != nil {
+		return Claim{}, err
+	}
+	return decodeClaim(v), nil
 }
 
-func (r *RedisStore) ReleaseRoom(ctx context.Context, roomID, nodeID string) error {
-	return releaseScript.Run(ctx, r.rdb, []string{roomKeyPrefix + roomID}, nodeID).Err()
+func (r *RedisStore) RenewRoom(ctx context.Context, roomID string, claim Claim, ttl time.Duration) (bool, error) {
+	n, err := renewScript.Run(ctx, r.rdb, []string{roomKeyPrefix + roomID}, claim.encode(), ttl.Milliseconds()).Int()
+	return n == 1, err
+}
+
+func (r *RedisStore) ReleaseRoom(ctx context.Context, roomID string, claim Claim) error {
+	return releaseScript.Run(ctx, r.rdb, []string{roomKeyPrefix + roomID}, claim.encode()).Err()
 }
 
 func (r *RedisStore) Close() error { return r.rdb.Close() }

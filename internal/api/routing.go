@@ -24,12 +24,6 @@ type Cluster interface {
 	Release(roomID string)
 }
 
-// Quota counts a tenant's rooms and participants across all nodes.
-type Quota interface {
-	TenantRooms(tenantID string) int
-	TenantParticipants(tenantID string) int
-}
-
 func routed(r *http.Request) bool { return r.Header.Get(cluster.RoutedHeader) != "" }
 
 // owned runs h on the node that owns the {room}: here, or forwarded there.

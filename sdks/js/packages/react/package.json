@@ -1,0 +1,20 @@
+{
+  "name": "@sfu-engine/react",
+  "version": "0.1.0",
+  "description": "React components and hooks for the SFU engine: a full video conference in a few lines.",
+  "type": "module",
+  "main": "./dist/index.cjs",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": { "types": "./dist/index.d.ts", "import": "./dist/index.js", "require": "./dist/index.cjs" }
+  },
+  "files": ["dist"],
+  "sideEffects": false,
+  "dependencies": { "@sfu-engine/client": "0.1.0" },
+  "peerDependencies": { "react": ">=18" },
+  "scripts": {
+    "build": "tsup src/index.tsx --format esm,cjs --clean --external react --external @sfu-engine/client && tsc -p tsconfig.build.json"
+  },
+  "license": "UNLICENSED"
+}

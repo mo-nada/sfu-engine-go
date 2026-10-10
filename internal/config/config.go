@@ -51,9 +51,12 @@ type Config struct {
 	// node takes no new rooms. 0 shuts down at once.
 	DrainTimeout time.Duration
 
-	// For embedding and tests: ready-made stores instead of URLs.
-	Store        store.Store
-	ClusterStore cluster.Store
+	// For embedding and tests: ready-made stores instead of URLs, and
+	// heartbeat timing (zero means the defaults).
+	Store             store.Store
+	ClusterStore      cluster.Store
+	HeartbeatInterval time.Duration
+	HeartbeatTTL      time.Duration
 }
 
 // Default returns a Config with sensible defaults.

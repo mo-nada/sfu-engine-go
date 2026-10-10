@@ -1,0 +1,18 @@
+{
+  "name": "@sfu-engine/server",
+  "version": "0.1.0",
+  "description": "Server SDK for the SFU engine: join tokens, room control, webhook verification, admin API (Node 18+).",
+  "type": "module",
+  "main": "./dist/index.cjs",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": { "types": "./dist/index.d.ts", "import": "./dist/index.js", "require": "./dist/index.cjs" }
+  },
+  "files": ["dist"],
+  "engines": { "node": ">=18" },
+  "scripts": {
+    "build": "tsup src/index.ts --format esm,cjs --clean --platform node && tsc -p tsconfig.build.json"
+  },
+  "license": "UNLICENSED"
+}

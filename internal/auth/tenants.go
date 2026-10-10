@@ -48,9 +48,14 @@ var ErrTenantDisabled = errors.New("auth: tenant disabled")
 type Tenants struct {
 	store store.Store
 
-	mu    sync.Mutex
-	cache map[string]cached // API key -> lookup result
+	mu      sync.Mutex
+	cache   map[string]cached    // known API key -> lookup result
+	unknown map[string]time.Time // unknown API key -> when looked up (bounded)
 }
+
+// maxUnknown bounds the cache of unknown API keys, which anyone can fill with
+// made-up keys; when full, it starts over.
+const maxUnknown = 10000
 
 type cached struct {
 	tenant Tenant
@@ -86,7 +91,7 @@ func NewTenantsWithStore(ctx context.Context, s store.Store, seed []Tenant) (*Te
 			return nil, fmt.Errorf("seed key of %q: %w", tn.ID, err)
 		}
 	}
-	return &Tenants{store: s, cache: make(map[string]cached)}, nil
+	return &Tenants{store: s, cache: make(map[string]cached), unknown: make(map[string]time.Time)}, nil
 }
 
 func validate(list []Tenant) error {
@@ -160,14 +165,19 @@ func (t *Tenants) Forget() {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	t.cache = make(map[string]cached)
+	t.unknown = make(map[string]time.Time)
 }
 
 func (t *Tenants) lookup(key string) (Tenant, error) {
 	t.mu.Lock()
 	c, ok := t.cache[key]
+	at, isUnknown := t.unknown[key]
 	t.mu.Unlock()
 	if ok && time.Since(c.at) < CacheTTL {
 		return c.tenant, c.err
+	}
+	if isUnknown && time.Since(at) < CacheTTL {
+		return Tenant{}, token.ErrUnknownIssuer
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -176,7 +186,14 @@ func (t *Tenants) lookup(key string) (Tenant, error) {
 	var tn Tenant
 	switch {
 	case errors.Is(err, store.ErrNotFound):
-		err = token.ErrUnknownIssuer
+		t.mu.Lock()
+		if len(t.unknown) >= maxUnknown {
+			t.unknown = make(map[string]time.Time)
+		}
+		t.unknown[key] = time.Now()
+		delete(t.cache, key) // a revoked key
+		t.mu.Unlock()
+		return Tenant{}, token.ErrUnknownIssuer
 	case err != nil:
 		return Tenant{}, err // store unavailable: do not cache
 	case st.Disabled:

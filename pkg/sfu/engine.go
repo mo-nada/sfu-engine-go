@@ -19,6 +19,7 @@ import (
 	"github.com/mo-nada/sfu-engine/internal/app"
 	"github.com/mo-nada/sfu-engine/internal/auth"
 	"github.com/mo-nada/sfu-engine/internal/config"
+	"github.com/mo-nada/sfu-engine/internal/store"
 )
 
 // Engine is an SFU server. An Engine runs once: after Run or Serve returns,
@@ -48,8 +49,14 @@ func New(opts ...Option) (*Engine, error) {
 	cfg.ShutdownTimeout = o.shutdownTimeout
 	cfg.TenantsFile = o.tenantsFile
 	cfg.Dev = o.dev
+	cfg.DatabaseURL, cfg.RedisURL, cfg.AdminSecret = o.databaseURL, o.redisURL, o.adminSecret
+	cfg.NodeID, cfg.NodeURL, cfg.DrainTimeout = o.nodeID, o.nodeURL, o.drainTimeout
 	for _, t := range o.tenants {
-		cfg.Tenants = append(cfg.Tenants, auth.Tenant{ID: t.ID, APIKey: t.APIKey, Secret: t.Secret, AutoCreateRooms: t.AutoCreateRooms})
+		cfg.Tenants = append(cfg.Tenants, auth.Tenant{
+			ID: t.ID, APIKey: t.APIKey, Secret: t.Secret, AutoCreateRooms: t.AutoCreateRooms,
+			Limits:     store.Limits{MaxRooms: t.MaxRooms, MaxParticipants: t.MaxParticipants, MaxRoomSize: t.MaxRoomSize},
+			WebhookURL: t.WebhookURL, WebhookSecret: t.WebhookSecret,
+		})
 	}
 	if err := cfg.Validate(); err != nil {
 		return nil, err

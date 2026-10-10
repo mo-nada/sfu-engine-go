@@ -230,7 +230,7 @@ Requirements:
 8. Signed webhooks to tenants on room and participant events.
 9. Horizontal scaling: each room on exactly one node, shared store for registry, load, placement and tenant state, routing of joins and API calls to the room's node, node draining, and a multi-node test.
 
-Order of work, in stages of about 300 changed lines: (1) tenants and join tokens — done; (2) server API v1 (2a rooms, participants, tokens; 2b server-side mute and permission updates); (3) client SDK; (4) server SDKs; (5) React SDK and Next.js example; (6) admin API, shared store and usage metering; (7) webhooks; (8) horizontal scaling and multi-node test.
+Order of work, in stages of about 300 changed lines: (1) tenants and join tokens — done; (2) server API v1 (2a rooms, participants, tokens; 2b server-side mute and permission updates) — done; (3) client SDK — done; (4) server SDKs (TypeScript, Go) — done; (5) React SDK — done, and the Next.js example source (not yet run); (6) admin API, shared store and usage metering — done; (7) webhooks — done; (8) horizontal scaling and multi-node test — done. Storage: PostgreSQL for tenants, keys and usage; Valkey/Redis for cluster state.
 
 SDKs live in this repository under `sdks/js/` (npm packages `client`, `react`, `server`, scope `@sfu-engine` until the user picks a product name). JS tooling (TypeScript, tsup, vitest, React as a peer dependency) needs the user's approval before it is downloaded.
 

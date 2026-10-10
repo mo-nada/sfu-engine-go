@@ -1,7 +1,7 @@
 openapi: 3.1.0
 info:
   title: SFU Engine HTTP API
-  version: 0.5.0
+  version: 0.6.0
   summary: HTTP endpoints of the Go WebRTC SFU engine.
   description: |
     The SFU has a small HTTP surface. Almost all interaction happens over the
@@ -19,8 +19,25 @@ info:
     `404`, exactly like a room that does not exist.
 
     **Errors** have the form `{"error": {"code": "...", "message": "..."}}`
-    with codes `unauthorized` (401), `invalid` (400), `not_found` (404),
-    `conflict` (409) and `internal` (500).
+    with codes `unauthorized` (401), `invalid` (400), `limit_reached` (403,
+    plan limit), `not_found` (404), `conflict` (409), `internal` (500) and
+    `unavailable` (503, retry).
+
+    **Plans.** Each tenant can have limits: concurrent rooms, concurrent
+    participants (all rooms together) and room size. They are counted across
+    all nodes, from counts that are at most a few seconds old.
+
+    **Many nodes.** Any node can be called: room calls are forwarded to the
+    node that owns the room, new rooms go to the least loaded node, and the
+    room list merges all nodes.
+
+    **Admin API (`/admin/v1`).** For the platform operator only: tenants, API
+    keys, limits, webhooks and usage for billing. It needs
+    `Authorization: Bearer <admin secret>` (the server's `SFU_ADMIN_SECRET`)
+    and exists only when that secret is set.
+
+    **Webhooks.** See the `webhooks` section: signed room events sent to each
+    tenant's `webhook_url`.
 
     **Joining** a room needs a join token (JWT, HS256); see the AsyncAPI
     document. Browsers may only open `/ws` from pages served by the same host.
@@ -31,6 +48,8 @@ servers:
     description: Local development server (default `-addr :8080`)
 security: []
 tags:
+  - name: admin
+    description: Operator admin API — tenants, keys, limits, usage
   - name: rooms
     description: Server API — rooms
   - name: participants
@@ -44,6 +63,161 @@ tags:
   - name: demo
     description: Browser demo client
 paths:
+  /admin/v1/tenants:
+    post:
+      tags: [admin]
+      operationId: adminCreateTenant
+      summary: Create a tenant (customer)
+      description: Returns the tenant's first API key and secret, and its webhook secret. The secrets are shown only here.
+      security: [{ adminSecret: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [id]
+              additionalProperties: false
+              properties:
+                id: { $ref: '#/components/schemas/id' }
+                name: { type: string }
+                auto_create_rooms: { type: boolean, default: false }
+                webhook_url: { type: string, format: uri }
+                limits: { $ref: '#/components/schemas/limits' }
+            example: { id: acme, name: Acme Inc, webhook_url: "https://acme.example/sfu-hook", limits: { max_rooms: 50, max_participants: 500, max_room_size: 25 } }
+      responses:
+        "201":
+          description: Created.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  tenant: { allOf: [{ $ref: '#/components/schemas/tenant' }, { type: object, properties: { webhook_secret: { type: string } } }] }
+                  api_key: { type: string, example: key_3f9a1c0b2d4e6f8a1b2c }
+                  api_secret: { type: string }
+        "400": { $ref: '#/components/responses/invalid' }
+        "401": { $ref: '#/components/responses/unauthorized' }
+        "403": { $ref: '#/components/responses/limitReached' }
+        "409": { $ref: '#/components/responses/conflict' }
+        "503": { $ref: '#/components/responses/unavailable' }
+    get:
+      tags: [admin]
+      operationId: adminListTenants
+      summary: List tenants
+      security: [{ adminSecret: [] }]
+      responses:
+        "200":
+          description: All tenants.
+          content: { application/json: { schema: { type: object, properties: { tenants: { type: array, items: { $ref: '#/components/schemas/tenant' } } } } } }
+        "401": { $ref: '#/components/responses/unauthorized' }
+  /admin/v1/tenants/{id}:
+    parameters:
+      - { name: id, in: path, required: true, schema: { $ref: '#/components/schemas/id' } }
+    get:
+      tags: [admin]
+      operationId: adminGetTenant
+      summary: Get a tenant
+      security: [{ adminSecret: [] }]
+      responses:
+        "200": { description: The tenant., content: { application/json: { schema: { $ref: '#/components/schemas/tenant' } } } }
+        "401": { $ref: '#/components/responses/unauthorized' }
+        "404": { $ref: '#/components/responses/notFound' }
+    patch:
+      tags: [admin]
+      operationId: adminUpdateTenant
+      summary: Update a tenant
+      description: |
+        Fields present are changed. `disabled: true` blocks the tenant (its
+        tokens stop working on every node within 10 seconds). With
+        `rotate_webhook_secret: true` the response contains the new secret.
+      security: [{ adminSecret: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              properties:
+                name: { type: string }
+                auto_create_rooms: { type: boolean }
+                webhook_url: { type: string }
+                limits: { $ref: '#/components/schemas/limits' }
+                disabled: { type: boolean }
+                rotate_webhook_secret: { type: boolean }
+      responses:
+        "200": { description: The tenant after the change., content: { application/json: { schema: { $ref: '#/components/schemas/tenant' } } } }
+        "400": { $ref: '#/components/responses/invalid' }
+        "401": { $ref: '#/components/responses/unauthorized' }
+        "404": { $ref: '#/components/responses/notFound' }
+  /admin/v1/tenants/{id}/keys:
+    parameters:
+      - { name: id, in: path, required: true, schema: { $ref: '#/components/schemas/id' } }
+    post:
+      tags: [admin]
+      operationId: adminCreateKey
+      summary: Create an API key (for rotation)
+      security: [{ adminSecret: [] }]
+      responses:
+        "201":
+          description: The new key. The secret is shown only here.
+          content: { application/json: { schema: { type: object, properties: { api_key: { type: string }, api_secret: { type: string }, created_at: { type: string, format: date-time } } } } }
+        "401": { $ref: '#/components/responses/unauthorized' }
+        "404": { $ref: '#/components/responses/notFound' }
+    get:
+      tags: [admin]
+      operationId: adminListKeys
+      summary: List a tenant's keys (without secrets)
+      security: [{ adminSecret: [] }]
+      responses:
+        "200":
+          description: Keys.
+          content: { application/json: { schema: { type: object, properties: { keys: { type: array, items: { type: object, properties: { api_key: { type: string }, tenant_id: { type: string }, created_at: { type: string, format: date-time }, revoked: { type: boolean } } } } } } } }
+        "401": { $ref: '#/components/responses/unauthorized' }
+        "404": { $ref: '#/components/responses/notFound' }
+  /admin/v1/tenants/{id}/keys/{key}:
+    parameters:
+      - { name: id, in: path, required: true, schema: { $ref: '#/components/schemas/id' } }
+      - { name: key, in: path, required: true, schema: { type: string } }
+    delete:
+      tags: [admin]
+      operationId: adminRevokeKey
+      summary: Revoke an API key
+      description: Tokens signed with it stop working on every node within 10 seconds.
+      security: [{ adminSecret: [] }]
+      responses:
+        "204": { description: Revoked. }
+        "401": { $ref: '#/components/responses/unauthorized' }
+        "404": { $ref: '#/components/responses/notFound' }
+  /admin/v1/tenants/{id}/usage:
+    parameters:
+      - { name: id, in: path, required: true, schema: { $ref: '#/components/schemas/id' } }
+    get:
+      tags: [admin]
+      operationId: adminUsage
+      summary: Usage for billing
+      description: Participant-minutes per UTC day. Default range is the current month up to today. Time is written every minute while people are connected.
+      security: [{ adminSecret: [] }]
+      parameters:
+        - { name: from, in: query, schema: { type: string, format: date, example: "2026-10-01" } }
+        - { name: to, in: query, schema: { type: string, format: date, example: "2026-10-31" } }
+      responses:
+        "200":
+          description: Usage.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  tenant_id: { type: string }
+                  from: { type: string, format: date }
+                  to: { type: string, format: date }
+                  days: { type: array, items: { type: object, properties: { day: { type: string, format: date }, participant_minutes: { type: number } } } }
+                  total_participant_minutes: { type: number }
+        "400": { $ref: '#/components/responses/invalid' }
+        "401": { $ref: '#/components/responses/unauthorized' }
+        "404": { $ref: '#/components/responses/notFound' }
   /v1/rooms:
     post:
       tags: [rooms]
@@ -386,8 +560,42 @@ paths:
           content:
             application/yaml:
               schema: { type: string }
+webhooks:
+  roomEvent:
+    post:
+      summary: Room event sent to the tenant's webhook_url
+      description: |
+        Events: `room_started`, `room_finished`, `participant_joined`,
+        `participant_left`, `track_published`, `track_unpublished`.
+
+        Headers: `X-SFU-Event: <event>` and
+        `X-SFU-Signature: t=<unix seconds>,v1=<hex HMAC-SHA256(webhook_secret, "<t>.<raw body>")>`.
+        Verify the signature over the raw body and reject old timestamps
+        (for example older than 5 minutes). Answer 2xx; other answers are
+        retried up to 3 times (except 4xx other than 408 and 429). Events of
+        one room can arrive out of order: use `created_at`.
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [id, event, created_at, room]
+              properties:
+                id: { type: string, example: evt_9f2c1a0b3d4e5f6a7b8c9d0e }
+                event: { type: string, enum: [room_started, room_finished, participant_joined, participant_left, track_published, track_unpublished] }
+                created_at: { type: string, format: date-time }
+                room: { type: object, properties: { name: { type: string } } }
+                participant: { type: object, properties: { identity: { type: string }, duration_seconds: { type: integer, description: 'participant_left only' } } }
+                track: { type: object, properties: { source: { type: string, enum: [camera, microphone, screen, screen-audio] } } }
+            example: { id: evt_9f2c1a0b3d4e5f6a7b8c9d0e, event: participant_left, created_at: "2026-10-10T09:30:00Z", room: { name: standup }, participant: { identity: alice, duration_seconds: 1820 } }
+      responses:
+        "200": { description: Received. }
 components:
   securitySchemes:
+    adminSecret:
+      type: http
+      scheme: bearer
+      description: The operator admin secret (SFU_ADMIN_SECRET).
     apiToken:
       type: http
       scheme: bearer
@@ -427,6 +635,23 @@ components:
           additionalProperties: { type: boolean }
           example: { microphone: true }
         grants: { $ref: '#/components/schemas/grants' }
+    limits:
+      type: object
+      description: Zero means no limit.
+      properties:
+        max_rooms: { type: integer, minimum: 0, description: Concurrent rooms. }
+        max_participants: { type: integer, minimum: 0, description: Concurrent participants in all rooms together. }
+        max_room_size: { type: integer, minimum: 0, description: Participants in one room. }
+    tenant:
+      type: object
+      properties:
+        id: { $ref: '#/components/schemas/id' }
+        name: { type: string }
+        auto_create_rooms: { type: boolean }
+        webhook_url: { type: string }
+        limits: { $ref: '#/components/schemas/limits' }
+        disabled: { type: boolean }
+        created_at: { type: string, format: date-time }
     grants:
       type: object
       additionalProperties: false
@@ -445,7 +670,7 @@ components:
           type: object
           required: [code, message]
           properties:
-            code: { type: string, enum: [unauthorized, invalid, not_found, conflict, internal] }
+            code: { type: string, enum: [unauthorized, invalid, limit_reached, not_found, conflict, internal, unavailable] }
             message: { type: string }
   responses:
     unauthorized:
@@ -456,6 +681,12 @@ components:
       content: { application/json: { schema: { $ref: '#/components/schemas/error' } } }
     notFound:
       description: No such room or participant for this tenant.
+      content: { application/json: { schema: { $ref: '#/components/schemas/error' } } }
+    limitReached:
+      description: A plan limit was reached.
+      content: { application/json: { schema: { $ref: '#/components/schemas/error' } } }
+    unavailable:
+      description: The cluster is temporarily unavailable; retry.
       content: { application/json: { schema: { $ref: '#/components/schemas/error' } } }
     conflict:
       description: The room already exists.

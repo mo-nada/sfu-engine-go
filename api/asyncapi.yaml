@@ -1,7 +1,7 @@
 asyncapi: 3.0.0
 info:
   title: SFU Engine Signaling API
-  version: 0.5.0
+  version: 0.6.0
   description: |
     WebSocket signaling protocol of the Go WebRTC SFU engine.
 
@@ -131,7 +131,7 @@ components:
     join:
       name: join
       title: Join a room (client → server)
-      summary: Must be the first message. The token names the room, the participant (unique in the room) and the permissions. Errors are "invalid token", "room not found" (the room must be created through the server API first, unless the tenant has auto_create_rooms), "participant already in room" and "room is full".
+      summary: 'Must be the first message. The token names the room, the participant (unique in the room) and the permissions. Errors are "invalid token", "room not found" (the room must be created through the server API first, unless the tenant has auto_create_rooms), "participant already in room", "room is full", "participant limit reached" and "room limit reached" (plan limits), and "room unavailable" (cluster problem; retry). The client may connect to any node: the join is forwarded to the node that owns the room, and media goes directly to that node.'
       payload:
         type: object
         required: [type, token]

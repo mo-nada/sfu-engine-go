@@ -63,11 +63,10 @@ type Server struct {
 	rooms   Rooms
 	logger  *slog.Logger
 	cluster Cluster // nil: single node
-	quota   Quota   // nil: no tenant limits
 }
 
-// SetPlatform enables multi-node routing and tenant limits. Call it before serving.
-func (s *Server) SetPlatform(c Cluster, q Quota) { s.cluster, s.quota = c, q }
+// SetCluster enables multi-node routing. Call it before serving.
+func (s *Server) SetCluster(c Cluster) { s.cluster = c }
 
 // NewServer creates the API server.
 func NewServer(tenants *auth.Tenants, rooms Rooms, logger *slog.Logger) *Server {
@@ -246,10 +245,8 @@ func (s *Server) createRoom(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	if max := tenant.Limits.MaxRooms; max > 0 && s.quota != nil && s.quota.TenantRooms(tenant.ID) >= max {
-		writeError(w, http.StatusForbidden, "limit_reached", fmt.Sprintf("your plan allows %d rooms at the same time", max))
-		return
-	}
+	// The rooms limit is checked by the room manager under its lock.
+	opts.TenantMaxRooms = tenant.Limits.MaxRooms
 
 	key := tenant.ID + "/" + req.Name
 	if s.cluster != nil {
@@ -501,6 +498,8 @@ func (s *Server) roomError(w http.ResponseWriter, err error) {
 		writeError(w, http.StatusNotFound, "not_found", "participant not found")
 	case errors.Is(err, room.ErrRoomExists):
 		writeError(w, http.StatusConflict, "conflict", "room already exists")
+	case errors.Is(err, room.ErrRoomLimit):
+		writeError(w, http.StatusForbidden, "limit_reached", "your plan allows no more rooms at the same time")
 	default:
 		s.logger.Error("api error", "err", err)
 		writeError(w, http.StatusInternalServerError, "internal", "internal error")

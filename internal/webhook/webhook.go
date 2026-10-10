@@ -9,6 +9,10 @@
 // timestamps, so replays are limited. Deliveries run in the background with
 // retries; they never block media or signaling. If the queue is full, events
 // are dropped and logged.
+//
+// Workers never wait between attempts: a retry is scheduled for later. Each
+// tenant has at most perTenant deliveries in flight, so one tenant's slow or
+// broken endpoint cannot hold up the others. Redirects are not followed.
 package webhook
 
 import (
@@ -41,7 +45,9 @@ const (
 	SignatureHeader   = "X-SFU-Signature"
 	EventHeader       = "X-SFU-Event"
 	queueSize         = 10000
-	workers           = 4
+	workers           = 8
+	perTenant         = 2 // deliveries in flight per tenant
+	closeTimeout      = 5 * time.Second
 	maxAttempts       = 4
 	requestTimeout    = 5 * time.Second
 	tenantCacheTTL    = 10 * time.Second
@@ -91,16 +97,20 @@ type Dispatcher struct {
 	// backoff is the wait before attempt n (n >= 1); tests shorten it.
 	backoff func(attempt int) time.Duration
 
-	queue chan delivery
-	wg    sync.WaitGroup
+	queue    chan delivery
+	stop     chan struct{} // closed by Close
+	deadline time.Time     // after Close: give up at this time
+	wg       sync.WaitGroup
 
-	mu    sync.Mutex
-	cache map[string]cachedTenant
+	mu       sync.Mutex
+	cache    map[string]cachedTenant
+	inflight map[string]int // tenant -> deliveries in progress
 }
 
 type delivery struct {
 	tenantID string
 	event    Event
+	attempt  int // attempts made so far
 }
 
 type cachedTenant struct {
@@ -112,13 +122,19 @@ type cachedTenant struct {
 // get no deliveries.
 func NewDispatcher(s store.Store, logger *slog.Logger) *Dispatcher {
 	d := &Dispatcher{
-		store:   s,
-		client:  &http.Client{Timeout: requestTimeout},
-		logger:  logger,
-		now:     time.Now,
-		backoff: func(n int) time.Duration { return time.Duration(1<<(2*(n-1))) * time.Second }, // 1 s, 4 s, 16 s
-		queue:   make(chan delivery, queueSize),
-		cache:   make(map[string]cachedTenant),
+		store: s,
+		client: &http.Client{
+			Timeout: requestTimeout,
+			// A receiver could redirect the signed POST to an internal address.
+			CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
+		},
+		logger:   logger,
+		now:      time.Now,
+		backoff:  func(n int) time.Duration { return time.Duration(1<<(2*(n-1))) * time.Second }, // 1 s, 4 s, 16 s
+		queue:    make(chan delivery, queueSize),
+		stop:     make(chan struct{}),
+		cache:    make(map[string]cachedTenant),
+		inflight: make(map[string]int),
 	}
 	for range workers {
 		d.wg.Go(d.work)
@@ -126,10 +142,23 @@ func NewDispatcher(s store.Store, logger *slog.Logger) *Dispatcher {
 	return d
 }
 
-// Close delivers what is queued (with at most one attempt each) and stops.
+// Close delivers what is queued (one attempt each, no retries) and stops,
+// waiting at most closeTimeout. Events still queued then are dropped.
 func (d *Dispatcher) Close() {
-	close(d.queue)
+	d.mu.Lock()
+	d.deadline = time.Now().Add(closeTimeout)
+	d.mu.Unlock()
+	close(d.stop)
 	d.wg.Wait()
+}
+
+func (d *Dispatcher) closing() bool {
+	select {
+	case <-d.stop:
+		return true
+	default:
+		return false
+	}
 }
 
 func (d *Dispatcher) RoomStarted(roomID string)  { d.emit(roomID, RoomStarted, nil, nil) }
@@ -155,17 +184,67 @@ func (d *Dispatcher) TrackUnpublished(roomID, participantID, source string) {
 func (d *Dispatcher) emit(roomID, name string, p *Participant, t *Track) {
 	tenant, roomName := room.SplitRoomID(roomID)
 	ev := Event{ID: newID(), Event: name, CreatedAt: d.now().UTC(), Room: RoomInfo{Name: roomName}, Participant: p, Track: t}
+	d.enqueue(delivery{tenantID: tenant, event: ev})
+}
+
+func (d *Dispatcher) enqueue(job delivery) {
+	if d.closing() {
+		return
+	}
 	select {
-	case d.queue <- delivery{tenantID: tenant, event: ev}:
+	case d.queue <- job:
 	default:
-		d.logger.Warn("webhook queue full, event dropped", "tenant_id", tenant, "event", name)
+		d.logger.Warn("webhook queue full, event dropped", "tenant_id", job.tenantID, "event", job.event.Event)
 	}
 }
 
+// later puts job back in the queue after wait (unless closing).
+func (d *Dispatcher) later(job delivery, wait time.Duration) {
+	time.AfterFunc(wait, func() { d.enqueue(job) })
+}
+
 func (d *Dispatcher) work() {
-	for job := range d.queue {
-		d.deliver(job)
+	for {
+		select {
+		case job := <-d.queue:
+			d.handle(job)
+		case <-d.stop:
+			// Deliver what is left, once each, until the deadline.
+			for {
+				d.mu.Lock()
+				late := time.Now().After(d.deadline)
+				d.mu.Unlock()
+				if late {
+					return
+				}
+				select {
+				case job := <-d.queue:
+					d.handle(job)
+				default:
+					return
+				}
+			}
+		}
 	}
+}
+
+func (d *Dispatcher) handle(job delivery) {
+	d.mu.Lock()
+	if d.inflight[job.tenantID] >= perTenant && !d.closing() {
+		d.mu.Unlock()
+		d.later(job, 200*time.Millisecond) // this tenant is busy: try again soon
+		return
+	}
+	d.inflight[job.tenantID]++
+	d.mu.Unlock()
+	defer func() {
+		d.mu.Lock()
+		if d.inflight[job.tenantID]--; d.inflight[job.tenantID] <= 0 {
+			delete(d.inflight, job.tenantID)
+		}
+		d.mu.Unlock()
+	}()
+	d.deliver(job)
 }
 
 func (d *Dispatcher) deliver(job delivery) {
@@ -177,21 +256,18 @@ func (d *Dispatcher) deliver(job delivery) {
 	if err != nil {
 		return
 	}
-	for attempt := 1; attempt <= maxAttempts; attempt++ {
-		status, err := d.post(url, secret, job.event.Event, body)
-		if err == nil && status >= 200 && status < 300 {
-			return
-		}
-		// 4xx (except 408 and 429) means the receiver rejects it; retrying will not help.
-		if err == nil && status >= 400 && status < 500 && status != 408 && status != 429 {
-			d.logger.Warn("webhook rejected", "tenant_id", job.tenantID, "event", job.event.Event, "status", status)
-			return
-		}
-		if attempt == maxAttempts {
-			d.logger.Warn("webhook failed", "tenant_id", job.tenantID, "event", job.event.Event, "status", status, "err", err)
-			return
-		}
-		time.Sleep(d.backoff(attempt))
+	job.attempt++
+	status, err := d.post(url, secret, job.event.Event, body)
+	switch {
+	case err == nil && status >= 200 && status < 300:
+		return
+	case err == nil && status >= 400 && status < 500 && status != 408 && status != 429:
+		// The receiver rejects it; retrying will not help.
+		d.logger.Warn("webhook rejected", "tenant_id", job.tenantID, "event", job.event.Event, "status", status)
+	case job.attempt >= maxAttempts || d.closing():
+		d.logger.Warn("webhook failed", "tenant_id", job.tenantID, "event", job.event.Event, "status", status, "err", err)
+	default:
+		d.later(job, d.backoff(job.attempt))
 	}
 }
 
