@@ -1,7 +1,7 @@
 asyncapi: 3.0.0
 info:
   title: SFU Engine Signaling API
-  version: 0.3.0
+  version: 0.4.0
   description: |
     WebSocket signaling protocol of the Go WebRTC SFU engine.
 
@@ -64,6 +64,7 @@ channels:
       muteRequest: { $ref: '#/components/messages/muteRequest' }
       muteEvent: { $ref: '#/components/messages/muteEvent' }
       leave: { $ref: '#/components/messages/leave' }
+      removed: { $ref: '#/components/messages/removed' }
       error: { $ref: '#/components/messages/error' }
 operations:
   sendToServer:
@@ -89,6 +90,7 @@ operations:
       - $ref: '#/channels/signaling/messages/subscriberOffer'
       - $ref: '#/channels/signaling/messages/serverCandidate'
       - $ref: '#/channels/signaling/messages/muteEvent'
+      - $ref: '#/channels/signaling/messages/removed'
       - $ref: '#/channels/signaling/messages/error'
 components:
   schemas:
@@ -123,7 +125,7 @@ components:
     join:
       name: join
       title: Join a room (client → server)
-      summary: Must be the first message. The token names the room, the participant (unique in the room) and the permissions. An invalid token gets the error "invalid token".
+      summary: Must be the first message. The token names the room, the participant (unique in the room) and the permissions. Errors are "invalid token", "participant already in room" and "room is full".
       payload:
         type: object
         required: [type, token]
@@ -274,6 +276,18 @@ components:
         required: [type]
         properties:
           type: { const: leave }
+    removed:
+      name: removed
+      title: You were removed (server → client)
+      summary: The server API removed this participant or closed the room. The connection closes right after.
+      payload:
+        type: object
+        required: [type, message]
+        properties:
+          type: { const: removed }
+          message: { type: string, description: 'Reason, for example "room closed" or "removed by the server".' }
+      examples:
+        - payload: { type: removed, message: room closed }
     error:
       name: error
       title: Request failed (server → client)

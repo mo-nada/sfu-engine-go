@@ -31,9 +31,10 @@ type client struct {
 	pending  map[string][]webrtc.ICECandidateInit // per target, before remote description
 	pendMu   sync.Mutex
 
-	joined chan struct{}
-	errors chan string
-	closed chan struct{}
+	joined  chan struct{}
+	errors  chan string
+	removed chan string // reason of a "removed" message
+	closed  chan struct{}
 
 	mu      sync.Mutex
 	offers  int            // subscriber offers received
@@ -60,6 +61,7 @@ func newClient(t *testing.T, wsURL, name string) *client {
 		pending: make(map[string][]webrtc.ICECandidateInit),
 		joined:  make(chan struct{}),
 		errors:  make(chan string, 16),
+		removed: make(chan string, 1),
 		closed:  make(chan struct{}),
 		packets: make(map[string]int),
 		tracks:  make(map[string]int),
@@ -142,6 +144,8 @@ func (c *client) readLoop() {
 			c.addCandidate(msg.Target, *msg.Candidate)
 		case signaling.TypeError:
 			c.errors <- msg.Message
+		case signaling.TypeRemoved:
+			c.removed <- msg.Message
 		}
 	}
 }

@@ -3,7 +3,11 @@ package room
 import (
 	"errors"
 	"log/slog"
+	"maps"
+	"sort"
+	"strings"
 	"sync"
+	"time"
 )
 
 var (
@@ -13,6 +17,12 @@ var (
 	ErrManagerClosed = errors.New("room manager closed")
 	// ErrNotInRoom is returned when the participant is not in the room.
 	ErrNotInRoom = errors.New("participant not in room")
+	// ErrRoomExists is returned by Create when the room already exists.
+	ErrRoomExists = errors.New("room already exists")
+	// ErrRoomNotFound is returned when the room does not exist.
+	ErrRoomNotFound = errors.New("room not found")
+	// ErrRoomFull is returned by Join when the room has MaxParticipants.
+	ErrRoomFull = errors.New("room is full")
 )
 
 // Manager owns all rooms. Join and Leave are serialized by one lock, so a
@@ -41,12 +51,23 @@ func (m *Manager) Join(roomID string, p *Participant) (*Room, error) {
 
 	r, ok := m.rooms[roomID]
 	if !ok {
-		r = newRoom(roomID, m.logger)
+		r = newRoom(roomID, Options{}, false, m.logger)
 		m.rooms[roomID] = r
 		m.logger.Info("room created", "room_id", roomID)
 	}
+	// A duplicate ID is reported as such even when the room is full.
+	if _, exists := r.Participant(p.ID()); exists {
+		return nil, ErrDuplicateParticipant
+	}
+	if max := r.opts.MaxParticipants; max > 0 && r.count() >= max {
+		return nil, ErrRoomFull
+	}
 	if !r.add(p) {
 		return nil, ErrDuplicateParticipant
+	}
+	if r.emptyTimer != nil {
+		r.emptyTimer.Stop()
+		r.emptyTimer = nil
 	}
 
 	// Notify under the lock, so the roster and later events arrive in order.
@@ -87,38 +108,212 @@ func (m *Manager) SetMuted(roomID, participantID, source string, muted bool) err
 // Leave removes the participant and closes its peers. The room is removed when
 // it becomes empty. Leaving a room or participant that does not exist is a no-op.
 func (m *Manager) Leave(roomID, participantID string) {
+	_ = m.leave(roomID, participantID, nil, "")
+}
+
+// LeaveParticipant is like Leave, but only removes p itself: if p already
+// left and a new participant now uses the same ID, it does nothing. A session
+// that ends uses this, so it can never remove a newer session of the same user.
+func (m *Manager) LeaveParticipant(roomID string, p *Participant) {
+	_ = m.leave(roomID, p.ID(), p, "")
+}
+
+// leave removes participantID (only if it is want, when want is set). If
+// reason is set, the participant is first sent EventRemoved. Membership is
+// checked and changed under one lock hold.
+func (m *Manager) leave(roomID, participantID string, want *Participant, reason string) error {
 	m.mu.Lock()
 	r, ok := m.rooms[roomID]
 	if !ok {
 		m.mu.Unlock()
-		return
+		return ErrRoomNotFound
 	}
-	p, remaining := r.remove(participantID)
-	if remaining == 0 {
+	p, ok := r.Participant(participantID)
+	if !ok || (want != nil && p != want) {
+		m.mu.Unlock()
+		return ErrNotInRoom
+	}
+	if reason != "" {
+		p.send(Event{Kind: EventRemoved, Reason: reason})
+	}
+	_, remaining := r.remove(participantID)
+	removeRoom := remaining == 0 && !r.explicit
+	if removeRoom {
 		delete(m.rooms, roomID)
+	} else if remaining == 0 {
+		m.startEmptyTimer(r) // explicit rooms wait for EmptyTimeout
 	}
-	if p != nil {
-		for _, o := range r.Participants() {
-			o.send(Event{Kind: EventLeft, Participant: participantID})
-		}
+	for _, o := range r.Participants() {
+		o.send(Event{Kind: EventLeft, Participant: participantID})
 	}
 	m.mu.Unlock()
 
-	if p == nil {
-		return
-	}
-	r.router.RemoveSubscriber(participantID)
-	if remaining == 0 {
+	r.router.RemoveSubscriber(participantID, p.subscriber)
+	if removeRoom {
 		r.router.Close()
 	}
 	// Close outside the lock: closing peers can be slow, and peer callbacks may call Leave.
 	if err := p.Close(); err != nil {
 		m.logger.Warn("participant close error", "room_id", roomID, "participant_id", participantID, "err", err)
 	}
-	m.logger.Info("participant left", "room_id", roomID, "participant_id", participantID)
-	if remaining == 0 {
+	if reason != "" {
+		m.logger.Info("participant removed", "room_id", roomID, "participant_id", participantID, "reason", reason)
+	} else {
+		m.logger.Info("participant left", "room_id", roomID, "participant_id", participantID)
+	}
+	if removeRoom {
 		m.logger.Info("room closed", "room_id", roomID)
 	}
+	return nil
+}
+
+// DefaultEmptyTimeout is used by Create when opts.EmptyTimeout is not positive.
+const DefaultEmptyTimeout = 5 * time.Minute
+
+// Create creates an explicit room with opts. It stays open while empty until
+// opts.EmptyTimeout (DefaultEmptyTimeout if not set), then it is removed.
+func (m *Manager) Create(roomID string, opts Options) (*Room, error) {
+	if opts.EmptyTimeout <= 0 {
+		opts.EmptyTimeout = DefaultEmptyTimeout
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.closed {
+		return nil, ErrManagerClosed
+	}
+	if _, ok := m.rooms[roomID]; ok {
+		return nil, ErrRoomExists
+	}
+	r := newRoom(roomID, opts, true, m.logger)
+	m.rooms[roomID] = r
+	m.startEmptyTimer(r)
+	m.logger.Info("room created", "room_id", roomID, "max_participants", opts.MaxParticipants, "empty_timeout", opts.EmptyTimeout)
+	return r, nil
+}
+
+// startEmptyTimer removes r after its EmptyTimeout if it is still empty then.
+// It must be called with m.mu held.
+func (m *Manager) startEmptyTimer(r *Room) {
+	if r.emptyTimer != nil {
+		r.emptyTimer.Stop()
+	}
+	r.emptyTimer = time.AfterFunc(r.opts.EmptyTimeout, func() {
+		m.mu.Lock()
+		if m.rooms[r.id] != r || r.count() > 0 {
+			m.mu.Unlock()
+			return
+		}
+		delete(m.rooms, r.id)
+		m.mu.Unlock()
+		r.router.Close()
+		m.logger.Info("room closed", "room_id", r.id, "reason", "empty timeout")
+	})
+}
+
+// Remove takes participantID out of the room: it is told why (EventRemoved),
+// leaves the room, and its peers are closed.
+func (m *Manager) Remove(roomID, participantID, reason string) error {
+	return m.leave(roomID, participantID, nil, reason)
+}
+
+// Delete closes the room: every participant is told why (EventRemoved) and
+// closed, and the room is removed at once.
+func (m *Manager) Delete(roomID, reason string) error {
+	m.mu.Lock()
+	r, ok := m.rooms[roomID]
+	if !ok {
+		m.mu.Unlock()
+		return ErrRoomNotFound
+	}
+	delete(m.rooms, roomID)
+	if r.emptyTimer != nil {
+		r.emptyTimer.Stop()
+	}
+	removed := r.removeAll()
+	for _, p := range removed {
+		p.send(Event{Kind: EventRemoved, Reason: reason})
+	}
+	m.mu.Unlock()
+
+	r.router.Close()
+	for _, p := range removed {
+		if err := p.Close(); err != nil {
+			m.logger.Warn("participant close error", "room_id", roomID, "participant_id", p.ID(), "err", err)
+		}
+	}
+	m.logger.Info("room closed", "room_id", roomID, "reason", reason, "participants", len(removed))
+	return nil
+}
+
+// RoomSummary describes a room.
+type RoomSummary struct {
+	ID              string
+	CreatedAt       time.Time
+	NumParticipants int
+	Options         Options
+	Explicit        bool
+}
+
+// ParticipantDetail describes a participant in a room.
+type ParticipantDetail struct {
+	ID       string
+	JoinedAt time.Time
+	Muted    map[string]bool
+	Sources  []string // sources being published, sorted
+}
+
+// List returns the rooms whose ID starts with prefix, sorted by ID.
+func (m *Manager) List(prefix string) []RoomSummary {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var out []RoomSummary
+	for id, r := range m.rooms {
+		if strings.HasPrefix(id, prefix) {
+			out = append(out, r.summary())
+		}
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
+	return out
+}
+
+// Summary returns one room's summary.
+func (m *Manager) Summary(roomID string) (RoomSummary, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	r, ok := m.rooms[roomID]
+	if !ok {
+		return RoomSummary{}, ErrRoomNotFound
+	}
+	return r.summary(), nil
+}
+
+// Details returns the participants of a room, sorted by ID.
+func (m *Manager) Details(roomID string) ([]ParticipantDetail, error) {
+	m.mu.Lock()
+	r, ok := m.rooms[roomID]
+	m.mu.Unlock()
+	if !ok {
+		return nil, ErrRoomNotFound
+	}
+	parts := r.Participants()
+	out := make([]ParticipantDetail, 0, len(parts))
+	for _, p := range parts {
+		p.mu.Lock()
+		muted := maps.Clone(p.muted)
+		p.mu.Unlock()
+		out = append(out, ParticipantDetail{
+			ID:       p.ID(),
+			JoinedAt: p.joinedAt,
+			Muted:    muted,
+			Sources:  r.router.PublishedSources(p.ID()),
+		})
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
+	return out, nil
+}
+
+func (r *Room) summary() RoomSummary {
+	return RoomSummary{ID: r.id, CreatedAt: r.createdAt, NumParticipants: r.count(), Options: r.opts, Explicit: r.explicit}
 }
 
 // Room returns the room with the given ID.
@@ -138,6 +333,9 @@ func (m *Manager) Close() {
 	m.mu.Unlock()
 
 	for id, r := range rooms {
+		if r.emptyTimer != nil {
+			r.emptyTimer.Stop()
+		}
 		r.router.Close()
 		for _, p := range r.removeAll() {
 			if err := p.Close(); err != nil {

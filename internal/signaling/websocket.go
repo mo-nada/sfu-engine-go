@@ -124,6 +124,7 @@ type session struct {
 	joinLogger    *slog.Logger
 	grants        token.Grants
 	roomID        string // tenant-scoped room key: "<tenant>/<room>"
+	participant   *room.Participant
 	participantID string
 	publisher     *peer.Peer
 	subscriber    *peer.Peer
@@ -283,14 +284,23 @@ func (s *session) join(tok string) {
 		s.send(Message{Type: TypeOffer, SDP: o.SDP})
 	})
 
-	notify := func(e room.Event) { s.send(eventMessage(roomName, participantID, e)) }
-	r, err := s.h.rooms.Join(roomID, room.NewParticipant(participantID, pub, sub, notify))
+	notify := func(e room.Event) {
+		s.send(eventMessage(roomName, participantID, e))
+		if e.Kind == room.EventRemoved {
+			go s.close() // close flushes the "removed" message first
+		}
+	}
+	participant := room.NewParticipant(participantID, pub, sub, notify)
+	r, err := s.h.rooms.Join(roomID, participant)
 	if err != nil {
 		_ = pub.Close()
 		_ = sub.Close()
-		if errors.Is(err, room.ErrDuplicateParticipant) {
+		switch {
+		case errors.Is(err, room.ErrDuplicateParticipant):
 			s.sendError("participant already in room")
-		} else {
+		case errors.Is(err, room.ErrRoomFull):
+			s.sendError("room is full")
+		default:
 			s.failJoin(logger, err)
 		}
 		return
@@ -299,7 +309,7 @@ func (s *session) join(tok string) {
 	s.mu.Lock()
 	s.joinLogger = logger
 	s.grants = grants
-	s.roomID, s.participantID = roomID, participantID
+	s.roomID, s.participantID, s.participant = roomID, participantID, participant
 	s.publisher, s.subscriber = pub, sub
 	s.mu.Unlock()
 
@@ -339,10 +349,10 @@ func (s *session) join(tok string) {
 	// wiring is done, so at least one of us calls Leave and the participant
 	// never stays in the room or the router. A second Leave is harmless.
 	if s.closed.Load() {
-		s.h.rooms.Leave(roomID, participantID)
+		s.h.rooms.LeaveParticipant(roomID, participant)
 		// If close's Leave ran first, our Leave finds no participant and does
-		// not touch the router, so undo AddSubscriber directly.
-		r.Router().RemoveSubscriber(participantID)
+		// not touch the router, so undo AddSubscriber directly (only our peer).
+		r.Router().RemoveSubscriber(participantID, sub)
 		return
 	}
 
@@ -442,10 +452,10 @@ func (s *session) close() {
 	s.h.mu.Unlock()
 
 	s.mu.Lock()
-	roomID, participantID := s.roomID, s.participantID
+	roomID, participant := s.roomID, s.participant
 	s.mu.Unlock()
-	if participantID != "" {
-		s.h.rooms.Leave(roomID, participantID)
+	if participant != nil {
+		s.h.rooms.LeaveParticipant(roomID, participant)
 	}
 
 	// Wait for writeLoop to flush. close never runs on the writeLoop goroutine
@@ -470,6 +480,8 @@ func eventMessage(roomID, participantID string, e room.Event) Message {
 		return Message{Type: TypeParticipantJoined, Participant: e.Participant}
 	case room.EventLeft:
 		return Message{Type: TypeParticipantLeft, Participant: e.Participant}
+	case room.EventRemoved:
+		return Message{Type: TypeRemoved, Message: e.Reason}
 	default: // room.EventMuted
 		muted := e.Muted
 		return Message{Type: TypeMute, Participant: e.Participant, Source: e.Source, Muted: &muted}

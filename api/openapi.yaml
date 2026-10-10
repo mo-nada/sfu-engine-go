@@ -1,22 +1,42 @@
 openapi: 3.1.0
 info:
   title: SFU Engine HTTP API
-  version: 0.3.0
+  version: 0.4.0
   summary: HTTP endpoints of the Go WebRTC SFU engine.
   description: |
     The SFU has a small HTTP surface. Almost all interaction happens over the
     WebSocket signaling connection at `/ws`. Its messages are described in the
     AsyncAPI document at `/api/asyncapi.yaml` (rendered at `/docs/signaling`).
 
-    Joining a room needs a join token (JWT, HS256) signed by a tenant; see the
-    AsyncAPI document for the claims. Browsers may only open `/ws` from pages
-    served by the same host.
+    **Server API (`/v1`).** Tenants' backends (and the server SDKs) manage
+    rooms and participants and create join tokens. Every `/v1` request needs
+    `Authorization: Bearer <API token>`: a JWT signed with HS256 and the
+    tenant secret, with claims `iss` (API key), `aud: "sfu-api"`, `iat` and
+    `exp` (at most 1 hour ahead). The secret itself is never sent. Join tokens
+    are not accepted here, and API tokens are not accepted for joining.
+
+    Everything is scoped to the token's tenant. Another tenant's room answers
+    `404`, exactly like a room that does not exist.
+
+    **Errors** have the form `{"error": {"code": "...", "message": "..."}}`
+    with codes `unauthorized` (401), `invalid` (400), `not_found` (404),
+    `conflict` (409) and `internal` (500).
+
+    **Joining** a room needs a join token (JWT, HS256); see the AsyncAPI
+    document. Browsers may only open `/ws` from pages served by the same host.
   license:
     name: See repository
 servers:
   - url: http://localhost:8080
     description: Local development server (default `-addr :8080`)
+security: []
 tags:
+  - name: rooms
+    description: Server API — rooms
+  - name: participants
+    description: Server API — participants in a room
+  - name: tokens
+    description: Server API — join tokens
   - name: signaling
     description: WebRTC signaling over WebSocket
   - name: operations
@@ -24,6 +44,159 @@ tags:
   - name: demo
     description: Browser demo client
 paths:
+  /v1/rooms:
+    post:
+      tags: [rooms]
+      operationId: createRoom
+      summary: Create a room
+      description: |
+        Creates a room with options. It stays open while empty for
+        `empty_timeout_seconds` (default 300), then it is removed. Rooms are
+        also created automatically when someone joins a room that does not
+        exist; those have no limits and are removed when the last person leaves.
+      security: [{ apiToken: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name]
+              additionalProperties: false
+              properties:
+                name: { $ref: '#/components/schemas/id' }
+                max_participants: { type: integer, minimum: 0, maximum: 1000, default: 0, description: '0 means no limit.' }
+                empty_timeout_seconds: { type: integer, minimum: 1, maximum: 86400, default: 300 }
+            example: { name: standup, max_participants: 10, empty_timeout_seconds: 600 }
+      responses:
+        "201": { description: Created., content: { application/json: { schema: { $ref: '#/components/schemas/room' } } } }
+        "400": { $ref: '#/components/responses/invalid' }
+        "401": { $ref: '#/components/responses/unauthorized' }
+        "409": { $ref: '#/components/responses/conflict' }
+    get:
+      tags: [rooms]
+      operationId: listRooms
+      summary: List rooms
+      security: [{ apiToken: [] }]
+      responses:
+        "200":
+          description: The tenant's rooms, sorted by name.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [rooms]
+                properties:
+                  rooms: { type: array, items: { $ref: '#/components/schemas/room' } }
+        "401": { $ref: '#/components/responses/unauthorized' }
+  /v1/rooms/{room}:
+    parameters:
+      - $ref: '#/components/parameters/room'
+    get:
+      tags: [rooms]
+      operationId: getRoom
+      summary: Get a room with its participants
+      security: [{ apiToken: [] }]
+      responses:
+        "200":
+          description: The room.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/room'
+                  - type: object
+                    properties:
+                      participants: { type: array, items: { $ref: '#/components/schemas/participant' } }
+        "400": { $ref: '#/components/responses/invalid' }
+        "401": { $ref: '#/components/responses/unauthorized' }
+        "404": { $ref: '#/components/responses/notFound' }
+    delete:
+      tags: [rooms]
+      operationId: deleteRoom
+      summary: Close a room
+      description: Every participant receives `removed` ("room closed") and is disconnected. The room is removed at once.
+      security: [{ apiToken: [] }]
+      responses:
+        "204": { description: Closed. }
+        "400": { $ref: '#/components/responses/invalid' }
+        "401": { $ref: '#/components/responses/unauthorized' }
+        "404": { $ref: '#/components/responses/notFound' }
+  /v1/rooms/{room}/participants:
+    parameters:
+      - $ref: '#/components/parameters/room'
+    get:
+      tags: [participants]
+      operationId: listParticipants
+      summary: List participants
+      security: [{ apiToken: [] }]
+      responses:
+        "200":
+          description: Participants, sorted by identity.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [participants]
+                properties:
+                  participants: { type: array, items: { $ref: '#/components/schemas/participant' } }
+        "400": { $ref: '#/components/responses/invalid' }
+        "401": { $ref: '#/components/responses/unauthorized' }
+        "404": { $ref: '#/components/responses/notFound' }
+  /v1/rooms/{room}/participants/{identity}:
+    parameters:
+      - $ref: '#/components/parameters/room'
+      - name: identity
+        in: path
+        required: true
+        schema: { $ref: '#/components/schemas/id' }
+    delete:
+      tags: [participants]
+      operationId: removeParticipant
+      summary: Remove a participant
+      description: The participant receives `removed` ("removed by the server") and is disconnected. Its tracks stop for everyone. It can join again with a valid token.
+      security: [{ apiToken: [] }]
+      responses:
+        "204": { description: Removed. }
+        "400": { $ref: '#/components/responses/invalid' }
+        "401": { $ref: '#/components/responses/unauthorized' }
+        "404": { $ref: '#/components/responses/notFound' }
+  /v1/tokens:
+    post:
+      tags: [tokens]
+      operationId: createToken
+      summary: Create a join token
+      description: |
+        Signs a join token for the tenant, for backends that do not sign tokens
+        themselves. Grants default to publish and subscribe, all sources.
+      security: [{ apiToken: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [room, identity]
+              additionalProperties: false
+              properties:
+                room: { $ref: '#/components/schemas/id' }
+                identity: { $ref: '#/components/schemas/id' }
+                ttl_seconds: { type: integer, minimum: 1, maximum: 86400, default: 3600 }
+                grants: { $ref: '#/components/schemas/grants' }
+            example: { room: standup, identity: alice, ttl_seconds: 3600, grants: { publish: true, subscribe: true, sources: [camera, microphone] } }
+      responses:
+        "201":
+          description: The join token.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [token, expires_at]
+                properties:
+                  token: { type: string }
+                  expires_at: { type: string, format: date-time }
+        "400": { $ref: '#/components/responses/invalid' }
+        "401": { $ref: '#/components/responses/unauthorized' }
   /ws:
     get:
       tags: [signaling]
@@ -151,3 +324,76 @@ paths:
           content:
             application/yaml:
               schema: { type: string }
+components:
+  securitySchemes:
+    apiToken:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: 'API token: HS256 JWT signed with the tenant secret, claims iss (API key), aud "sfu-api", iat, exp (at most 1 hour ahead).'
+  parameters:
+    room:
+      name: room
+      in: path
+      required: true
+      schema: { $ref: '#/components/schemas/id' }
+  schemas:
+    id:
+      type: string
+      pattern: '^[A-Za-z0-9_-]{1,64}$'
+    room:
+      type: object
+      required: [name, created_at, num_participants, max_participants, empty_timeout_seconds]
+      properties:
+        name: { $ref: '#/components/schemas/id' }
+        created_at: { type: string, format: date-time }
+        num_participants: { type: integer }
+        max_participants: { type: integer, description: '0 means no limit.' }
+        empty_timeout_seconds: { type: integer, description: '0 for rooms created by a join (removed when empty).' }
+    participant:
+      type: object
+      required: [identity, joined_at, sources, muted]
+      properties:
+        identity: { $ref: '#/components/schemas/id' }
+        joined_at: { type: string, format: date-time }
+        sources:
+          type: array
+          description: Sources being published.
+          items: { type: string, enum: [camera, microphone, screen, screen-audio] }
+        muted:
+          type: object
+          additionalProperties: { type: boolean }
+          example: { microphone: true }
+    grants:
+      type: object
+      additionalProperties: false
+      properties:
+        publish: { type: boolean, default: true }
+        subscribe: { type: boolean, default: true }
+        sources:
+          type: array
+          description: Allowed sources to publish. Empty or missing means all.
+          items: { type: string, enum: [camera, microphone, screen, screen-audio] }
+    error:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: object
+          required: [code, message]
+          properties:
+            code: { type: string, enum: [unauthorized, invalid, not_found, conflict, internal] }
+            message: { type: string }
+  responses:
+    unauthorized:
+      description: Missing or invalid API token.
+      content: { application/json: { schema: { $ref: '#/components/schemas/error' } } }
+    invalid:
+      description: Invalid request.
+      content: { application/json: { schema: { $ref: '#/components/schemas/error' } } }
+    notFound:
+      description: No such room or participant for this tenant.
+      content: { application/json: { schema: { $ref: '#/components/schemas/error' } } }
+    conflict:
+      description: The room already exists.
+      content: { application/json: { schema: { $ref: '#/components/schemas/error' } } }

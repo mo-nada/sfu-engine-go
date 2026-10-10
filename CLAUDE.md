@@ -174,7 +174,7 @@ Avoid circular dependencies. Define interfaces only where they clarify ownership
 
 ## 6. Development Roadmap
 
-Development must follow these phases in order, with one change decided by the user on 2026-10-10: Phase 1 is complete, and the **Platform Track** below comes next, before Phases 2–4. It brings forward the multi-tenancy, authentication and control API parts of Phase 6, and the horizontal scaling of Phase 5.
+Development must follow these phases in order, with one change decided by the user on 2026-10-10: Phase 1 is complete, and the **Platform Track** below comes next, before Phases 2–4. It brings forward the SDK, multi-tenancy, authentication and control API parts of Phase 6, and the horizontal scaling of Phase 5.
 
 ### Phase 1: Core Media Engine
 
@@ -212,24 +212,29 @@ Requirements:
 
 The primary milestone is a working, minimal SFU—not a complete production-grade media platform.
 
-### Platform Track: Multi-tenant Control API and Horizontal Scaling
+### Platform Track: Video Platform as a Service (SDKs, Control API, Scaling)
 
 **Current development phase.**
 
-Make the SFU a shared service that external backends control through an API, and that runs on many nodes.
+**Product goal (decided by the user):** run the SFU as a paid video service, like LiveKit. The operator sells subscriptions and gives each customer (tenant) an API key and secret. The customer's backend uses a **server SDK** to create rooms, issue join tokens and control rooms. The customer's frontend (React, Next.js and others) uses a **client SDK** and **React components** to join rooms and publish and receive camera, microphone and screen, without touching WebRTC. The REST API and signaling protocol are what the SDKs call; the SDKs are the product surface.
 
 Requirements:
 
-1. Tenants, each with an API key and a secret. Each tenant's rooms are fully isolated from other tenants.
-2. Signed, short-lived join tokens (JWT, HS256, standard library) that carry the room, the participant identity, and permissions (publish, subscribe, allowed sources). Signaling requires a valid token.
-3. A versioned REST control API (`/v1/...`, authenticated per tenant): rooms (create, list, get, close), participants (list, remove, server-side mute, permissions), and token creation.
-4. Signed webhooks to the tenant on room and participant events.
-5. Horizontal scaling: each room lives on exactly one node; a shared store (Redis) holds node registry, load, room placement and tenant state; joins and API calls are routed to the room's node; nodes can drain for upgrades.
-6. A multi-node test (two nodes and Redis).
+1. Tenants with API keys and secrets; full isolation between tenants.
+2. Join tokens (JWT HS256) carrying room, identity and grants; API tokens (JWT HS256, `aud: "sfu-api"`) for server-to-server calls. Secrets are never sent over the wire.
+3. Server API `/v1`: rooms (create with options, list, get, close), participants (list, remove, server-side mute, update permissions), join token creation.
+4. Client SDK (TypeScript): `Room`, local and remote participants, tracks, events, camera, microphone, screen share, devices, reconnect, quality settings.
+5. Server SDKs: TypeScript (Node, Next.js) first, then Go: token builder, room service client, webhook receiver.
+6. React SDK: context, hooks and components, including a prebuilt conference view; a Next.js example app.
+7. Operator admin API: tenants, API key create, rotate and revoke, plan limits, usage metering (participant-minutes) for billing. Tenants, keys and usage live in the shared store (Valkey/Redis).
+8. Signed webhooks to tenants on room and participant events.
+9. Horizontal scaling: each room on exactly one node, shared store for registry, load, placement and tenant state, routing of joins and API calls to the room's node, node draining, and a multi-node test.
 
-Stages, about 300 changed lines each: (1) tenants and join tokens; (2) control API v1 on one node; (3) webhooks; (4) shared-store interface with an in-memory implementation; (5) Redis store, node registry, placement and routing; (6) multi-node test.
+Order of work, in stages of about 300 changed lines: (1) tenants and join tokens — done; (2) server API v1 (2a rooms, participants, tokens; 2b server-side mute and permission updates); (3) client SDK; (4) server SDKs; (5) React SDK and Next.js example; (6) admin API, shared store and usage metering; (7) webhooks; (8) horizontal scaling and multi-node test.
 
-Rooms that span several nodes (media relayed between nodes) are out of scope for now.
+SDKs live in this repository under `sdks/js/` (npm packages `client`, `react`, `server`, scope `@sfu-engine` until the user picks a product name). JS tooling (TypeScript, tsup, vitest, React as a peer dependency) needs the user's approval before it is downloaded.
+
+Rooms that span several nodes (media relayed between nodes) and payment-provider integration are out of scope for now.
 
 ### Phase 2: Streaming Stability and Performance
 
@@ -386,6 +391,6 @@ If an architectural decision has significant long-term consequences, explain the
 
 ## 11. Current Objective
 
-The immediate objective is the **Platform Track** (see section 6), stage by stage: tenants and join tokens first, then the control API, webhooks, the shared-store interface, the Redis-backed multi-node setup, and a multi-node test.
+The immediate objective is the **Platform Track** (see section 6): turn the SFU into a LiveKit-like video platform service. Work in the listed order: server API v1, then the client SDK, server SDKs, React SDK with a Next.js example, the operator admin API with shared store and usage metering, webhooks, and horizontal scaling.
 
-The result must let an external backend create rooms, issue join tokens, and control participants through the API, with tenants isolated from each other, and must run on several nodes behind one entry point.
+Every endpoint and message must be usable from the SDKs, documented in `api/openapi.yaml` and `api/asyncapi.yaml`, tenant-isolated, and correct on several nodes.

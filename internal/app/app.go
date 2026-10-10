@@ -12,6 +12,7 @@ import (
 	"time"
 
 	apidocs "github.com/mo-nada/sfu-engine/api"
+	serverapi "github.com/mo-nada/sfu-engine/internal/api"
 	"github.com/mo-nada/sfu-engine/internal/auth"
 	"github.com/mo-nada/sfu-engine/internal/config"
 	"github.com/mo-nada/sfu-engine/internal/room"
@@ -67,6 +68,7 @@ func New(cfg config.Config, logger *slog.Logger) (*App, error) {
 		_, _ = w.Write([]byte("ok"))
 	})
 	mux.Handle("GET /ws", sig)
+	mux.Handle("/v1/", serverapi.NewServer(tenants, serverapi.LocalRooms{Manager: rooms}, logger).Handler())
 	if cfg.Dev {
 		mux.Handle("GET /dev/token", devTokenHandler(dev))
 	}

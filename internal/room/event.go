@@ -11,6 +11,10 @@ const (
 	EventLeft = "left"
 	// EventMuted is sent to the others when Participant mutes or unmutes Source.
 	EventMuted = "muted"
+	// EventRemoved is sent to a participant that the server removes (kicked,
+	// or its room closed). Reason says why. The participant is already out
+	// of the room when it arrives.
+	EventRemoved = "removed"
 )
 
 // Event is a room change delivered to a participant.
@@ -19,6 +23,7 @@ type Event struct {
 	Participant string
 	Source      string
 	Muted       bool
+	Reason      string
 	Roster      []ParticipantInfo
 }
 

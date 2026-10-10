@@ -111,3 +111,15 @@ func (t *Tenants) VerifyJoinToken(tok string, now time.Time) (Tenant, token.Clai
 	}
 	return t.byKey[c.Issuer], c, nil
 }
+
+// VerifyAPIToken checks an API token (see token.VerifyAPI) and returns its tenant.
+func (t *Tenants) VerifyAPIToken(tok string, now time.Time) (Tenant, error) {
+	c, err := token.VerifyAPI(tok, func(key string) (string, bool) {
+		tn, ok := t.byKey[key]
+		return tn.Secret, ok
+	}, now)
+	if err != nil {
+		return Tenant{}, err
+	}
+	return t.byKey[c.Issuer], nil
+}

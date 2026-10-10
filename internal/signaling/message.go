@@ -22,6 +22,8 @@
 //	client → server  answer     {sdp}                answer to that offer
 //	both ways        candidate  {target, candidate}  target is "publisher" or "subscriber"
 //	client → server  leave      {}
+//	server → client  removed    {message}            the server removed you (kicked, or the
+//	                                                 room was closed); the connection closes
 //	server → client  error      {message}
 //
 // Each participant uses two PeerConnections: on "publisher" the client
@@ -49,6 +51,7 @@ const (
 	TypeParticipantJoined = "participant-joined"
 	TypeParticipantLeft   = "participant-left"
 	TypeMute              = "mute"
+	TypeRemoved           = "removed"
 )
 
 // Candidate targets.

@@ -3,6 +3,7 @@ package room
 import (
 	"log/slog"
 	"sync"
+	"time"
 
 	"github.com/mo-nada/sfu-engine/internal/sfu"
 )
@@ -11,19 +12,44 @@ import (
 // Its membership is changed only through the Manager. Each room owns one
 // Router that forwards media between its participants.
 type Room struct {
-	id     string
-	router *sfu.Router
+	id        string
+	router    *sfu.Router
+	createdAt time.Time
+	opts      Options
+	// explicit rooms were created through the API: they stay open while
+	// empty until opts.EmptyTimeout. Implicit rooms (created by a join) are
+	// removed as soon as the last participant leaves.
+	explicit bool
+	// emptyTimer removes an empty explicit room. Guarded by the Manager lock.
+	emptyTimer *time.Timer
 
 	mu           sync.RWMutex
 	participants map[string]*Participant
 }
 
-func newRoom(id string, logger *slog.Logger) *Room {
+// Options are set when a room is created through the API.
+type Options struct {
+	// MaxParticipants limits the room size; 0 means no limit.
+	MaxParticipants int
+	// EmptyTimeout is how long an explicit room stays open with nobody in it.
+	EmptyTimeout time.Duration
+}
+
+func newRoom(id string, opts Options, explicit bool, logger *slog.Logger) *Room {
 	return &Room{
 		id:           id,
 		router:       sfu.NewRouter(logger.With("room_id", id)),
+		createdAt:    time.Now(),
+		opts:         opts,
+		explicit:     explicit,
 		participants: make(map[string]*Participant),
 	}
+}
+
+func (r *Room) count() int {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return len(r.participants)
 }
 
 // ID returns the room identifier.

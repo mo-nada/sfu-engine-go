@@ -8,8 +8,27 @@ detail in `api/asyncapi.yaml` and `api/openapi.yaml`.
 
 Last updated: 2026-10-10. Phase 1 is done, plus the Phase 3 controls
 (microphone, camera, screen share, roster, mute) and the quality settings. The
-current phase is the **Platform Track** (see CLAUDE.md section 6): multi-tenant
-control API and horizontal scaling. Stage 1 (tenants and join tokens) is done.
+current phase is the **Platform Track** (see CLAUDE.md section 6).
+
+**Product goal:** a LiveKit-like paid video service. Customers (tenants) get
+an API key and secret. They use a server SDK (create rooms, issue tokens,
+control rooms) and a client SDK with React components (join, camera,
+microphone, screen). The REST API and signaling are what the SDKs call.
+
+Order of work:
+
+1. tenants and tokens — done;
+2. server API v1: 2a done (rooms, participants, tokens); 2b next (server-side
+   mute, permission updates);
+3. client SDK (TypeScript);
+4. server SDKs (TypeScript, then Go);
+5. React SDK and a Next.js example;
+6. admin API, Valkey store and usage metering;
+7. webhooks;
+8. horizontal scaling.
+
+SDKs go under `sdks/js/` with scope `@sfu-engine` (a placeholder until the
+user picks a name). The JS tooling needs the user's yes before download.
 
 ## What it is
 
@@ -37,13 +56,14 @@ on one node, shared store in Valkey or Redis).
 |---|---|
 | `cmd/sfu` | flags → `config.Load` → `observability.NewLogger` → `app.New` → `Run`; Ctrl+C or SIGTERM cancels ctx |
 | `internal/config` | `Config` (Addr, LogLevel, LogFormat, STUNURLs, ShutdownTimeout, TenantsFile, Tenants, Dev), flags, `Validate` (needs tenants or dev) |
-| `internal/auth` | `Tenant{ID, APIKey, Secret}`, `NewTenants` (validates: unique id and key, secret ≥ 32 bytes), `LoadTenants(json)`, `DevTenant` (random secret), `VerifyJoinToken` |
-| `pkg/token` | Public, stdlib only: JWT HS256 `Claims{iss=api key, sub, room, iat, nbf, exp, grants{publish, subscribe, sources}}`, `New`, `Sign`, `Verify` (rejects other algorithms, 30 s leeway) |
+| `internal/auth` | `Tenant{ID, APIKey, Secret}`, `NewTenants` (validates: unique id, key and secret; secret ≥ 32 bytes), `LoadTenants(json)`, `DevTenant` (random secret), `VerifyJoinToken`, `VerifyAPIToken` |
+| `pkg/token` | Public, stdlib only, JWT HS256. Join `Claims{iss=api key, sub, room, iat, nbf, exp ≤ 24 h, grants{publish, subscribe, sources}}` with `New`, `Sign`, `Verify`. API `APIClaims{iss, aud="sfu-api", iat, exp ≤ 1 h}` with `NewAPI`, `SignAPI`, `VerifyAPI`. The two kinds are not interchangeable. Strict base64, 30 s leeway |
+| `internal/api` | Server API `/v1`: Bearer API token → tenant in context. Routes: rooms (POST, GET list, GET one with participants, DELETE = close), participants (GET, DELETE = remove), POST tokens. Talks to rooms through the `Rooms` interface (`LocalRooms` wraps `room.Manager`; it will route to the owner node when scaling). Errors are `{"error": {code, message}}`; another tenant's room is `404` |
 | `internal/observability` | `NewLogger`: tint colored text in a terminal (respects `NO_COLOR`), JSON otherwise |
 | `internal/app` | Wires the Pion API, tenants (file + programmatic + dev), `room.Manager`, `signaling.Handler`, routes (`/dev/token` only with `-dev`). `Serve` shutdown order: HTTP Shutdown → `signaling.Close` (parallel) → `rooms.Close` |
 | `internal/transport` | `NewAPI()` (default codecs and interceptors; one API is shared, Pion copies the MediaEngine per PC), `Configuration(stunURLs)` |
 | `internal/peer` | `Peer` = one PeerConnection. `HandleOffer` (client offers), `Negotiate` / `OnOffer` / `HandleAnswer` (server offers, **one offer in flight**, extra requests merged into one follow-up), early ICE candidate queue (max 64), `OnTrack`, `AddTrack` / `RemoveTrack`, `WriteRTCP`, `CreateDataChannel`, `Close` (idempotent; `OnClose` runs once, **outside** `sync.Once`) |
-| `internal/room` | `Manager` → `Room` → `Participant`. Manager lock serializes Join, Leave and SetMuted **and the event notifications**, so all participants see events in one order. A Room owns one `sfu.Router`. A Participant owns two peers (publisher, subscriber), mute state, and a non-blocking `Notifier` |
+| `internal/room` | `Manager` → `Room` → `Participant`. Explicit rooms (`Create` with `Options{MaxParticipants, EmptyTimeout}`) stay open while empty until the timeout; implicit rooms (created by a join) are removed when empty. `Remove` (kick) and `Delete` (close room) send `EventRemoved` first. `List(prefix)`, `Summary` and `Details` serve the API. Manager lock serializes Join, Leave and SetMuted **and the event notifications**, so all participants see events in one order. A Room owns one `sfu.Router`. A Participant owns two peers (publisher, subscriber), mute state, and a non-blocking `Notifier` |
 | `internal/sfu` | `Router` per room. `Publish(publisherID, source, peer, remoteTrack)`: one shared `TrackLocalStaticRTP` per published track, attached to every other subscriber. Read loop → `WriteRTP` (Pion copies to each subscriber). PLI when someone subscribes; subscriber PLI and FIR passed to the publisher. Track removed when `ReadRTP` fails. Sources and `StreamID` in `source.go` |
 | `internal/signaling` | WebSocket `Handler`; one `session` per connection with **3 goroutines**: readLoop (handles messages in order), writeLoop (the only writer; `send` queues up to 256 and never blocks, and a full queue disconnects the slow client), pingLoop (30 s ping, 60 s pong timeout) |
 | `internal/web` | Embedded pages: `/` demo client, `/docs` (Swagger UI from CDN), `/docs/signaling` (AsyncAPI viewer from CDN) |
@@ -134,7 +154,7 @@ on one node, shared store in Valkey or Redis).
 
 ## Known limitations
 
-- No control API or webhooks yet (Platform Track stages 2–3).
+- No server-side mute or permission updates yet (stage 2b), no webhooks, and no SDKs yet.
 - Single node (Platform Track stages 4–6).
 - Token revocation is not possible; keep tokens short-lived.
 - No TURN server.
@@ -158,7 +178,8 @@ on one node, shared store in Valkey or Redis).
 | `19ef4b2` | Controls stage A: track sources and stream IDs |
 | `a569b42` | Controls stage B (roster, mute, writer goroutine), API docs, stage C (page controls), this file |
 | `b4d2775` | Quality: strip RTP header extensions, camera and screen constraints and bitrates, quality overlay |
-| (uncommitted) | CLAUDE.md Platform Track rules; Platform stage 1: tenants, join tokens, grants, dev mode |
+| `22c04e6` | CLAUDE.md Platform Track rules; Platform stage 1: tenants, join tokens, grants, dev mode |
+| (uncommitted) | CLAUDE.md product goal (LiveKit-like, SDKs); Platform stage 2a: API tokens, server API `/v1` (rooms, participants, tokens), `removed` message, room options |
 
 ## Working agreements (from the user)
 

@@ -7,6 +7,8 @@ import (
 	"io"
 	"log/slog"
 	"net"
+	"net/http"
+	"strings"
 	"testing"
 	"time"
 
@@ -251,5 +253,87 @@ func TestGrantsLimitSources(t *testing.T) {
 	}
 	if n := bob.received("alice/screen"); n != 0 {
 		t.Errorf("bob received %d screen packets, want 0", n)
+	}
+}
+
+// apiCall sends a server API request as tenant acme and returns the status.
+func apiCall(t *testing.T, wsURL, method, path, body string) int {
+	t.Helper()
+	base := "http://" + strings.TrimSuffix(strings.TrimPrefix(wsURL, "ws://"), "/ws")
+	req, _ := http.NewRequest(method, base+path, strings.NewReader(body))
+	tok, err := token.SignAPI(acme.Secret, token.NewAPI(acme.APIKey, time.Minute))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Authorization", "Bearer "+tok)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	return resp.StatusCode
+}
+
+func expectRemoved(t *testing.T, c *client) {
+	t.Helper()
+	select {
+	case <-c.removed:
+	case <-time.After(5 * time.Second):
+		t.Fatalf("%s: no removed message", c.name)
+	}
+	select {
+	case <-c.closed:
+	case <-time.After(5 * time.Second):
+		t.Fatalf("%s: connection not closed after removal", c.name)
+	}
+}
+
+// The server API removes a participant and closes a room; the clients are
+// told and disconnected, and media stops.
+func TestAPIRemoveParticipantAndCloseRoom(t *testing.T) {
+	url := startServer(t)
+	if s := apiCall(t, url, "POST", "/v1/rooms", `{"name":"room1","max_participants":3}`); s != http.StatusCreated {
+		t.Fatalf("create room: %d", s)
+	}
+
+	alice := newClient(t, url, "alice")
+	alice.join("room1")
+	bob := newClient(t, url, "bob")
+	bob.join("room1")
+	carol := newClient(t, url, "carol")
+	carol.join("room1")
+
+	// The room is full (max 3).
+	dave := newClient(t, url, "dave")
+	dave.send(signalingJoin(t, "room1", "dave"))
+	select {
+	case msg := <-dave.errors:
+		if msg != "room is full" {
+			t.Errorf("dave error = %q, want room is full", msg)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("no error for a full room")
+	}
+
+	alice.publishVideo()
+	eventually(t, "bob receives alice", func() bool { return bob.received("alice/media") >= 10 })
+
+	if s := apiCall(t, url, "DELETE", "/v1/rooms/room1/participants/alice", ""); s != http.StatusNoContent {
+		t.Fatalf("remove alice: %d", s)
+	}
+	expectRemoved(t, alice)
+	eventually(t, "bob stops receiving alice", func() bool {
+		before := bob.received("alice/media")
+		time.Sleep(300 * time.Millisecond)
+		return bob.received("alice/media") == before
+	})
+
+	if s := apiCall(t, url, "DELETE", "/v1/rooms/room1", ""); s != http.StatusNoContent {
+		t.Fatalf("close room: %d", s)
+	}
+	expectRemoved(t, bob)
+	expectRemoved(t, carol)
+	if s := apiCall(t, url, "GET", "/v1/rooms/room1", ""); s != http.StatusNotFound {
+		t.Errorf("closed room: %d, want 404", s)
 	}
 }

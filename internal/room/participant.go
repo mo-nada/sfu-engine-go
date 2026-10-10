@@ -9,6 +9,7 @@ import (
 	"errors"
 	"maps"
 	"sync"
+	"time"
 
 	"github.com/mo-nada/sfu-engine/internal/peer"
 )
@@ -21,6 +22,7 @@ type Participant struct {
 	publisher  *peer.Peer
 	subscriber *peer.Peer
 	notify     Notifier
+	joinedAt   time.Time
 
 	mu    sync.Mutex
 	muted map[string]bool // source -> muted
@@ -29,7 +31,8 @@ type Participant struct {
 // NewParticipant creates a participant. Either peer may be nil if it has not
 // been created yet. notify receives room events and may be nil.
 func NewParticipant(id string, publisher, subscriber *peer.Peer, notify Notifier) *Participant {
-	return &Participant{id: id, publisher: publisher, subscriber: subscriber, notify: notify, muted: make(map[string]bool)}
+	return &Participant{id: id, publisher: publisher, subscriber: subscriber, notify: notify,
+		joinedAt: time.Now(), muted: make(map[string]bool)}
 }
 
 func (p *Participant) send(e Event) {

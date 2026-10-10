@@ -4,6 +4,7 @@ package sfu
 import (
 	"errors"
 	"log/slog"
+	"sort"
 	"sync"
 
 	"github.com/pion/rtcp"
@@ -41,6 +42,7 @@ type Router struct {
 
 type publishedTrack struct {
 	key         string
+	source      string
 	publisherID string
 	publisher   *peer.Peer
 	remote      *webrtc.TrackRemote
@@ -74,6 +76,7 @@ func (r *Router) Publish(publisherID, source string, publisher *peer.Peer, remot
 	}
 	t := &publishedTrack{
 		key:         key,
+		source:      source,
 		publisherID: publisherID,
 		publisher:   publisher,
 		remote:      remote,
@@ -134,11 +137,29 @@ func (r *Router) AddSubscriber(participantID string, sub *peer.Peer) {
 	}
 }
 
-// RemoveSubscriber forgets a participant's subscribe peer. The caller closes
-// the peer; its senders stop with it.
-func (r *Router) RemoveSubscriber(participantID string) {
+// PublishedSources returns the sources publisherID is currently publishing, sorted.
+func (r *Router) PublishedSources(publisherID string) []string {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	var out []string
+	for _, t := range r.tracks {
+		if t.publisherID == publisherID {
+			out = append(out, t.source)
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
+// RemoveSubscriber forgets participantID's subscribe peer, but only if it is
+// sub: a newer session of the same participant is left alone. The caller
+// closes the peer; its senders stop with it.
+func (r *Router) RemoveSubscriber(participantID string, sub *peer.Peer) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.subscribers[participantID] != sub {
+		return
+	}
 	delete(r.subscribers, participantID)
 	for _, t := range r.tracks {
 		delete(t.senders, participantID)

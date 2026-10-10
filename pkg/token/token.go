@@ -1,4 +1,4 @@
-// Package token creates and verifies SFU join tokens.
+// Package token creates and verifies SFU join tokens and API tokens.
 //
 // A join token is a JWT signed with HMAC-SHA256 (HS256). A tenant's backend
 // signs one per user with the tenant's API key (as the issuer) and secret.
@@ -12,6 +12,11 @@
 //	room    room name (same rules)
 //	iat, nbf, exp   Unix seconds; exp is required and at most MaxTTL ahead
 //	grants  {publish, subscribe, sources}; sources empty means all sources
+//
+// An API token authenticates a tenant's backend to the server API (/v1). It
+// is a JWT signed the same way, with claims iss (API key), aud "sfu-api",
+// iat and exp (at most MaxAPITTL ahead). Join and API tokens cannot be used
+// in place of each other.
 package token
 
 import (
@@ -99,68 +104,98 @@ func Sign(secret string, c Claims) (string, error) {
 	if err := c.validate(); err != nil {
 		return "", err
 	}
-	payload, err := json.Marshal(c)
-	if err != nil {
-		return "", err
-	}
-	signing := b64.EncodeToString([]byte(header)) + "." + b64.EncodeToString(payload)
-	return signing + "." + b64.EncodeToString(mac(secret, signing)), nil
+	return sign(secret, c)
 }
 
-// Verify checks the token's algorithm, signature and validity window at now.
-// secretFor returns the secret for an API key, or false if the key is unknown.
+// Verify checks a join token's algorithm, signature and validity window at
+// now. secretFor returns the secret for an API key, or false if the key is
+// unknown.
 func Verify(tok string, secretFor func(apiKey string) (string, bool), now time.Time) (Claims, error) {
-	parts := strings.Split(tok, ".")
-	// The decoder skips '\r' and '\n'; reject them so encodings stay unique.
-	if len(parts) != 3 || strings.ContainsAny(tok, "\r\n") {
-		return Claims{}, ErrMalformed
-	}
-	rawHeader, err := b64.DecodeString(parts[0])
+	payload, err := verifySignature(tok, secretFor)
 	if err != nil {
-		return Claims{}, ErrMalformed
-	}
-	var h struct {
-		Alg string `json:"alg"`
-	}
-	if err := json.Unmarshal(rawHeader, &h); err != nil {
-		return Claims{}, ErrMalformed
-	}
-	// Only HS256: rejects "none" and algorithm-confusion attacks.
-	if h.Alg != "HS256" {
-		return Claims{}, ErrAlgorithm
-	}
-	rawPayload, err := b64.DecodeString(parts[1])
-	if err != nil {
-		return Claims{}, ErrMalformed
+		return Claims{}, err
 	}
 	var c Claims
-	if err := json.Unmarshal(rawPayload, &c); err != nil {
+	if err := json.Unmarshal(payload, &c); err != nil {
 		return Claims{}, ErrMalformed
 	}
-	secret, ok := secretFor(c.Issuer)
-	if !ok {
-		return Claims{}, ErrUnknownIssuer
-	}
-	sig, err := b64.DecodeString(parts[2])
-	if err != nil {
-		return Claims{}, ErrMalformed
-	}
-	if !hmac.Equal(sig, mac(secret, parts[0]+"."+parts[1])) {
-		return Claims{}, ErrSignature
-	}
-	if c.ExpiresAt == 0 || now.After(time.Unix(c.ExpiresAt, 0).Add(Leeway)) {
-		return Claims{}, ErrExpired
-	}
-	if time.Unix(c.ExpiresAt, 0).After(now.Add(MaxTTL + Leeway)) {
-		return Claims{}, fmt.Errorf("%w: expires more than %s from now", ErrInvalidClaims, MaxTTL)
-	}
-	if c.NotBefore != 0 && now.Add(Leeway).Before(time.Unix(c.NotBefore, 0)) {
-		return Claims{}, ErrNotYetValid
+	if err := checkTimes(c.NotBefore, c.ExpiresAt, MaxTTL, now); err != nil {
+		return Claims{}, err
 	}
 	if err := c.validate(); err != nil {
 		return Claims{}, err
 	}
 	return c, nil
+}
+
+// verifySignature checks the format, the algorithm and the HMAC, and returns
+// the decoded payload. The secret is looked up by the payload's "iss".
+func verifySignature(tok string, secretFor func(apiKey string) (string, bool)) ([]byte, error) {
+	parts := strings.Split(tok, ".")
+	// The decoder skips '\r' and '\n'; reject them so encodings stay unique.
+	if len(parts) != 3 || strings.ContainsAny(tok, "\r\n") {
+		return nil, ErrMalformed
+	}
+	rawHeader, err := b64.DecodeString(parts[0])
+	if err != nil {
+		return nil, ErrMalformed
+	}
+	var h struct {
+		Alg string `json:"alg"`
+	}
+	if err := json.Unmarshal(rawHeader, &h); err != nil {
+		return nil, ErrMalformed
+	}
+	// Only HS256: rejects "none" and algorithm-confusion attacks.
+	if h.Alg != "HS256" {
+		return nil, ErrAlgorithm
+	}
+	payload, err := b64.DecodeString(parts[1])
+	if err != nil {
+		return nil, ErrMalformed
+	}
+	var iss struct {
+		Issuer string `json:"iss"`
+	}
+	if err := json.Unmarshal(payload, &iss); err != nil {
+		return nil, ErrMalformed
+	}
+	secret, ok := secretFor(iss.Issuer)
+	if !ok {
+		return nil, ErrUnknownIssuer
+	}
+	sig, err := b64.DecodeString(parts[2])
+	if err != nil {
+		return nil, ErrMalformed
+	}
+	if !hmac.Equal(sig, mac(secret, parts[0]+"."+parts[1])) {
+		return nil, ErrSignature
+	}
+	return payload, nil
+}
+
+// checkTimes checks exp (required, not past, at most maxTTL ahead) and nbf.
+func checkTimes(nbf, exp int64, maxTTL time.Duration, now time.Time) error {
+	if exp == 0 || now.After(time.Unix(exp, 0).Add(Leeway)) {
+		return ErrExpired
+	}
+	if time.Unix(exp, 0).After(now.Add(maxTTL + Leeway)) {
+		return fmt.Errorf("%w: expires more than %s from now", ErrInvalidClaims, maxTTL)
+	}
+	if nbf != 0 && now.Add(Leeway).Before(time.Unix(nbf, 0)) {
+		return ErrNotYetValid
+	}
+	return nil
+}
+
+// sign encodes and signs any claims value.
+func sign(secret string, claims any) (string, error) {
+	payload, err := json.Marshal(claims)
+	if err != nil {
+		return "", err
+	}
+	signing := b64.EncodeToString([]byte(header)) + "." + b64.EncodeToString(payload)
+	return signing + "." + b64.EncodeToString(mac(secret, signing)), nil
 }
 
 func (c Claims) validate() error {

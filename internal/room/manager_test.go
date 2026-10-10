@@ -242,3 +242,149 @@ func TestRosterJoinLeaveAndMuteEvents(t *testing.T) {
 		t.Errorf("SetMuted unknown: err = %v, want ErrNotInRoom", err)
 	}
 }
+
+func TestCreateExplicitRoomAndEmptyTimeout(t *testing.T) {
+	m := NewManager(discardLogger())
+	if _, err := m.Create("t/r1", Options{MaxParticipants: 2, EmptyTimeout: 150 * time.Millisecond}); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	if _, err := m.Create("t/r1", Options{}); !errors.Is(err, ErrRoomExists) {
+		t.Errorf("second Create: err = %v, want ErrRoomExists", err)
+	}
+
+	// Joining stops the empty timer; leaving restarts it instead of removing the room.
+	_, _ = m.Join("t/r1", NewParticipant("alice", nil, nil, nil))
+	time.Sleep(250 * time.Millisecond)
+	if _, ok := m.Room("t/r1"); !ok {
+		t.Fatal("room with a participant was removed by the empty timer")
+	}
+	m.Leave("t/r1", "alice")
+	if _, ok := m.Room("t/r1"); !ok {
+		t.Fatal("explicit room removed right after the last participant left")
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		if _, ok := m.Room("t/r1"); !ok {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("empty explicit room not removed after EmptyTimeout")
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+func TestMaxParticipants(t *testing.T) {
+	m := NewManager(discardLogger())
+	_, _ = m.Create("t/r1", Options{MaxParticipants: 1, EmptyTimeout: time.Minute})
+	if _, err := m.Join("t/r1", NewParticipant("alice", nil, nil, nil)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := m.Join("t/r1", NewParticipant("bob", nil, nil, nil)); !errors.Is(err, ErrRoomFull) {
+		t.Errorf("err = %v, want ErrRoomFull", err)
+	}
+}
+
+func TestRemoveAndDeleteNotifyAndClose(t *testing.T) {
+	m := NewManager(discardLogger())
+	alice, bob, carol := &recorder{}, &recorder{}, &recorder{}
+	_, _ = m.Join("t/r1", NewParticipant("alice", nil, nil, alice.notify))
+	_, _ = m.Join("t/r1", NewParticipant("bob", nil, nil, bob.notify))
+
+	if err := m.Remove("t/r1", "bob", "kicked"); err != nil {
+		t.Fatalf("Remove: %v", err)
+	}
+	if got := bob.all(); got[len(got)-1].Kind != EventRemoved || got[len(got)-1].Reason != "kicked" {
+		t.Errorf("bob's last event = %+v, want removed/kicked", got[len(got)-1])
+	}
+	if got := alice.all(); got[len(got)-1].Kind != EventLeft || got[len(got)-1].Participant != "bob" {
+		t.Errorf("alice's last event = %+v, want bob left", got[len(got)-1])
+	}
+	if err := m.Remove("t/r1", "bob", "again"); !errors.Is(err, ErrNotInRoom) {
+		t.Errorf("Remove twice: err = %v, want ErrNotInRoom", err)
+	}
+
+	_, _ = m.Join("t/r1", NewParticipant("carol", nil, nil, carol.notify))
+	if err := m.Delete("t/r1", "room closed"); err != nil {
+		t.Fatalf("Delete: %v", err)
+	}
+	for name, r := range map[string]*recorder{"alice": alice, "carol": carol} {
+		if got := r.all(); got[len(got)-1].Kind != EventRemoved {
+			t.Errorf("%s's last event = %+v, want removed", name, got[len(got)-1])
+		}
+	}
+	if _, ok := m.Room("t/r1"); ok {
+		t.Error("room still exists after Delete")
+	}
+	if err := m.Delete("t/r1", "x"); !errors.Is(err, ErrRoomNotFound) {
+		t.Errorf("Delete twice: err = %v, want ErrRoomNotFound", err)
+	}
+}
+
+func TestListSummaryDetails(t *testing.T) {
+	m := NewManager(discardLogger())
+	_, _ = m.Create("acme/b", Options{MaxParticipants: 5, EmptyTimeout: time.Minute})
+	_, _ = m.Join("acme/a", NewParticipant("alice", nil, nil, nil))
+	_, _ = m.Join("globex/a", NewParticipant("eve", nil, nil, nil))
+	_ = m.SetMuted("acme/a", "alice", "microphone", true)
+
+	list := m.List("acme/")
+	if len(list) != 2 || list[0].ID != "acme/a" || list[1].ID != "acme/b" || list[0].NumParticipants != 1 {
+		t.Fatalf("List = %+v", list)
+	}
+	s, err := m.Summary("acme/b")
+	if err != nil || s.Options.MaxParticipants != 5 || !s.Explicit {
+		t.Errorf("Summary = %+v, %v", s, err)
+	}
+	d, err := m.Details("acme/a")
+	if err != nil || len(d) != 1 || d[0].ID != "alice" || !d[0].Muted["microphone"] || d[0].JoinedAt.IsZero() {
+		t.Errorf("Details = %+v, %v", d, err)
+	}
+	if _, err := m.Details("acme/missing"); !errors.Is(err, ErrRoomNotFound) {
+		t.Errorf("Details missing: err = %v", err)
+	}
+}
+
+func TestCreateWithoutTimeoutUsesDefault(t *testing.T) {
+	m := NewManager(discardLogger())
+	r, err := m.Create("t/r1", Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if r.opts.EmptyTimeout != DefaultEmptyTimeout {
+		t.Errorf("EmptyTimeout = %v, want default", r.opts.EmptyTimeout)
+	}
+	time.Sleep(50 * time.Millisecond)
+	if _, ok := m.Room("t/r1"); !ok {
+		t.Error("room without a timeout was removed at once")
+	}
+}
+
+func TestDuplicateReportedBeforeFull(t *testing.T) {
+	m := NewManager(discardLogger())
+	_, _ = m.Create("t/r1", Options{MaxParticipants: 1})
+	_, _ = m.Join("t/r1", NewParticipant("alice", nil, nil, nil))
+	if _, err := m.Join("t/r1", NewParticipant("alice", nil, nil, nil)); !errors.Is(err, ErrDuplicateParticipant) {
+		t.Errorf("err = %v, want ErrDuplicateParticipant", err)
+	}
+}
+
+// A late leave of an old session must not remove a newer session that uses
+// the same identity.
+func TestLeaveParticipantOnlyRemovesItself(t *testing.T) {
+	m := NewManager(discardLogger())
+	old := NewParticipant("alice", nil, nil, nil)
+	_, _ = m.Join("t/r1", old)
+	_, _ = m.Join("t/r1", NewParticipant("bob", nil, nil, nil)) // keeps the room open
+	m.Leave("t/r1", "alice")
+
+	fresh := NewParticipant("alice", nil, nil, nil)
+	if _, err := m.Join("t/r1", fresh); err != nil {
+		t.Fatal(err)
+	}
+	m.LeaveParticipant("t/r1", old) // the old session ends late
+	r, _ := m.Room("t/r1")
+	if p, ok := r.Participant("alice"); !ok || p != fresh {
+		t.Error("the old session's leave removed the new session")
+	}
+}

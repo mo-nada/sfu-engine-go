@@ -96,6 +96,32 @@ c.Grants.Sources = []string{"camera", "microphone"} // no screen share
 tok, err := token.Sign(secret, c)
 ```
 
+## Server API (`/v1`)
+
+Tenants' backends manage rooms with a REST API. This is what the server SDKs
+call. Each request carries `Authorization: Bearer <API token>`: a short-lived
+HS256 JWT signed with the tenant secret, with claims `iss` (API key),
+`aud: "sfu-api"`, `iat` and `exp` (at most 1 hour). The secret itself is never sent.
+
+| Method | Path | Does |
+|---|---|---|
+| `POST` | `/v1/rooms` | Create a room `{name, max_participants, empty_timeout_seconds}` |
+| `GET` | `/v1/rooms` | List rooms |
+| `GET` | `/v1/rooms/{room}` | Room with its participants |
+| `DELETE` | `/v1/rooms/{room}` | Close the room; everyone is disconnected |
+| `GET` | `/v1/rooms/{room}/participants` | List participants (sources, mute state) |
+| `DELETE` | `/v1/rooms/{room}/participants/{identity}` | Remove a participant |
+| `POST` | `/v1/tokens` | Create a join token `{room, identity, ttl_seconds, grants}` |
+
+Full details are in `api/openapi.yaml`, rendered at `/docs`.
+
+```go
+apiTok, _ := token.SignAPI(secret, token.NewAPI("acme-key", 5*time.Minute))
+// curl -X POST -H "Authorization: Bearer $apiTok" -d '{"name":"standup"}' http://localhost:8080/v1/rooms
+```
+
+A tenant never sees another tenant's rooms: they answer `404`.
+
 ## Embedding in a Go application
 
 ```go
@@ -146,6 +172,7 @@ can never collide.
 | client → server | `mute` | `source`, `muted` | Report that you muted or unmuted a source |
 | server → client | `mute` | `participant`, `source`, `muted` | Another participant did |
 | client → server | `leave` | none | Leave the room and close the connection |
+| server → client | `removed` | `message` | The server API removed you or closed the room; the connection closes |
 | server → client | `error` | `message` | The request failed |
 
 **Stream IDs.** A forwarded track's stream ID is `<participant>/media` for camera
@@ -219,7 +246,7 @@ isolation, disconnect cleanup, and duplicate names.
 
 These are planned for later phases:
 
-- **No control API or webhooks yet.** These come in the next Platform Track stages.
+- **No server-side mute or permission updates yet** (next stage), **no webhooks**, and **no SDKs yet**; these come in the next Platform Track stages.
 - **Single node.** Horizontal scaling comes in the next Platform Track stages.
 - **Same-origin browsers only.** A web page served from another host cannot
   connect to `/ws`. Non-browser clients are not affected.
