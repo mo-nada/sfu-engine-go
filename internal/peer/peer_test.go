@@ -4,11 +4,14 @@ import (
 	"errors"
 	"io"
 	"log/slog"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/pion/rtcp"
 	"github.com/pion/webrtc/v4"
+	"github.com/pion/webrtc/v4/pkg/media"
 
 	"github.com/mo-nada/sfu-engine/internal/transport"
 )
@@ -231,21 +234,13 @@ func connectServerOffer(t *testing.T, server *Peer, client *webrtc.PeerConnectio
 	serverCandidates := make(chan webrtc.ICECandidateInit, 64)
 	server.OnICECandidate(func(c webrtc.ICECandidateInit) { serverCandidates <- c })
 
-	offer, err := server.CreateOffer()
-	if err != nil {
-		t.Fatalf("CreateOffer: %v", err)
+	offers := make(chan webrtc.SessionDescription, 1)
+	server.OnOffer(func(o webrtc.SessionDescription) { offers <- o })
+	if err := server.Negotiate(); err != nil {
+		t.Fatalf("Negotiate: %v", err)
 	}
-	if err := client.SetRemoteDescription(offer); err != nil {
-		t.Fatalf("client set remote: %v", err)
-	}
-	answer, err := client.CreateAnswer(nil)
-	if err != nil {
-		t.Fatalf("client create answer: %v", err)
-	}
+	answer := clientAnswer(t, client, <-offers)
 	gathered := webrtc.GatheringCompletePromise(client)
-	if err := client.SetLocalDescription(answer); err != nil {
-		t.Fatalf("client set local: %v", err)
-	}
 	<-gathered
 	clientCandidates := extractCandidates(t, client)
 
@@ -272,7 +267,7 @@ func connectServerOffer(t *testing.T, server *Peer, client *webrtc.PeerConnectio
 	waitState(t, server, webrtc.PeerConnectionStateConnected)
 }
 
-func TestCreateOfferConnects(t *testing.T) {
+func TestNegotiateConnects(t *testing.T) {
 	server, api := newTestPeer(t)
 	client, err := api.NewPeerConnection(transport.Configuration(nil))
 	if err != nil {
@@ -282,7 +277,7 @@ func TestCreateOfferConnects(t *testing.T) {
 	connectServerOffer(t, server, client, false)
 }
 
-func TestCreateOfferEarlyCandidatesAreQueued(t *testing.T) {
+func TestNegotiateEarlyCandidatesAreQueued(t *testing.T) {
 	server, api := newTestPeer(t)
 	client, err := api.NewPeerConnection(transport.Configuration(nil))
 	if err != nil {
@@ -301,5 +296,194 @@ func TestHandleAnswerRejectsBadInput(t *testing.T) {
 	// An answer without a pending local offer is invalid.
 	if err := server.HandleAnswer(webrtc.SessionDescription{Type: webrtc.SDPTypeAnswer, SDP: "v=0"}); err == nil {
 		t.Error("want error for answer without offer")
+	}
+}
+
+// clientAnswer applies offer on the client and returns the client's answer.
+func clientAnswer(t *testing.T, client *webrtc.PeerConnection, offer webrtc.SessionDescription) webrtc.SessionDescription {
+	t.Helper()
+	if err := client.SetRemoteDescription(offer); err != nil {
+		t.Fatalf("client set remote: %v", err)
+	}
+	answer, err := client.CreateAnswer(nil)
+	if err != nil {
+		t.Fatalf("client create answer: %v", err)
+	}
+	if err := client.SetLocalDescription(answer); err != nil {
+		t.Fatalf("client set local: %v", err)
+	}
+	return answer
+}
+
+func newVideoTrack(t *testing.T, id string) *webrtc.TrackLocalStaticSample {
+	t.Helper()
+	track, err := webrtc.NewTrackLocalStaticSample(webrtc.RTPCodecCapability{MimeType: webrtc.MimeTypeVP8}, id, "stream-"+id)
+	if err != nil {
+		t.Fatalf("new track: %v", err)
+	}
+	return track
+}
+
+// While an offer waits for its answer, more Negotiate calls must not create
+// new offers; HandleAnswer must then send exactly one follow-up offer.
+func TestNegotiateCoalescesWhileOfferInFlight(t *testing.T) {
+	server, api := newTestPeer(t)
+	client, err := api.NewPeerConnection(transport.Configuration(nil))
+	if err != nil {
+		t.Fatalf("client: %v", err)
+	}
+	t.Cleanup(func() { _ = client.Close() })
+
+	offers := make(chan webrtc.SessionDescription, 4)
+	server.OnOffer(func(o webrtc.SessionDescription) { offers <- o })
+
+	if _, err := server.AddTrack(newVideoTrack(t, "v1")); err != nil {
+		t.Fatalf("AddTrack: %v", err)
+	}
+	if err := server.Negotiate(); err != nil {
+		t.Fatalf("Negotiate: %v", err)
+	}
+	first := <-offers
+
+	// Two more changes while the first offer is unanswered.
+	if _, err := server.AddTrack(newVideoTrack(t, "v2")); err != nil {
+		t.Fatalf("AddTrack: %v", err)
+	}
+	for range 2 {
+		if err := server.Negotiate(); err != nil {
+			t.Fatalf("Negotiate: %v", err)
+		}
+	}
+	if len(offers) != 0 {
+		t.Fatalf("got %d offers while one was in flight, want 0", len(offers))
+	}
+
+	if err := server.HandleAnswer(clientAnswer(t, client, first)); err != nil {
+		t.Fatalf("HandleAnswer: %v", err)
+	}
+	if len(offers) != 1 {
+		t.Fatalf("got %d follow-up offers, want 1", len(offers))
+	}
+	second := <-offers
+	if n := strings.Count(second.SDP, "m=video"); n != 2 {
+		t.Errorf("follow-up offer has %d video sections, want 2", n)
+	}
+
+	if err := server.HandleAnswer(clientAnswer(t, client, second)); err != nil {
+		t.Fatalf("HandleAnswer: %v", err)
+	}
+	if len(offers) != 0 {
+		t.Errorf("got %d extra offers after the last answer, want 0", len(offers))
+	}
+}
+
+func TestOnTrackFiresWhenClientPublishes(t *testing.T) {
+	server, api := newTestPeer(t)
+	gotTrack := make(chan *webrtc.TrackRemote, 1)
+	server.OnTrack(func(tr *webrtc.TrackRemote, _ *webrtc.RTPReceiver) { gotTrack <- tr })
+
+	client, err := api.NewPeerConnection(transport.Configuration(nil))
+	if err != nil {
+		t.Fatalf("client: %v", err)
+	}
+	t.Cleanup(func() { _ = client.Close() })
+	track := newVideoTrack(t, "cam")
+	if _, err := client.AddTrack(track); err != nil {
+		t.Fatalf("client AddTrack: %v", err)
+	}
+
+	connect(t, server, client, false)
+
+	// Send samples until the server reports the track.
+	stop := make(chan struct{})
+	defer close(stop)
+	go func() {
+		tick := time.NewTicker(20 * time.Millisecond)
+		defer tick.Stop()
+		for {
+			select {
+			case <-stop:
+				return
+			case <-tick.C:
+				_ = track.WriteSample(media.Sample{Data: []byte{0x10, 0x00, 0x00, 0x9d, 0x01, 0x2a}, Duration: 20 * time.Millisecond})
+			}
+		}
+	}()
+
+	select {
+	case tr := <-gotTrack:
+		if tr.Kind() != webrtc.RTPCodecTypeVideo || tr.Codec().MimeType != webrtc.MimeTypeVP8 {
+			t.Errorf("got track kind=%s codec=%s, want video VP8", tr.Kind(), tr.Codec().MimeType)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("OnTrack did not fire")
+	}
+}
+
+func TestWriteRTCPSendsPLI(t *testing.T) {
+	server, api := newTestPeer(t)
+	client := newClient(t, api)
+	connect(t, server, client, false)
+
+	// A PLI for an unknown SSRC is still a valid RTCP packet; it must be sent without error.
+	if err := server.WriteRTCP([]rtcp.Packet{&rtcp.PictureLossIndication{MediaSSRC: 1234}}); err != nil {
+		t.Errorf("WriteRTCP: %v", err)
+	}
+}
+
+// A rejected answer keeps the offer in flight: a later valid answer to the
+// same offer is still accepted, and a negotiation requested meanwhile follows.
+func TestBadAnswerKeepsOfferInFlight(t *testing.T) {
+	server, api := newTestPeer(t)
+	client, err := api.NewPeerConnection(transport.Configuration(nil))
+	if err != nil {
+		t.Fatalf("client: %v", err)
+	}
+	t.Cleanup(func() { _ = client.Close() })
+
+	offers := make(chan webrtc.SessionDescription, 2)
+	server.OnOffer(func(o webrtc.SessionDescription) { offers <- o })
+	if _, err := server.AddTrack(newVideoTrack(t, "v1")); err != nil {
+		t.Fatalf("AddTrack: %v", err)
+	}
+	if err := server.Negotiate(); err != nil {
+		t.Fatalf("Negotiate: %v", err)
+	}
+	offer := <-offers
+
+	if err := server.HandleAnswer(webrtc.SessionDescription{Type: webrtc.SDPTypeAnswer, SDP: "garbage"}); err == nil {
+		t.Fatal("HandleAnswer accepted a garbage answer")
+	}
+	if err := server.Negotiate(); err != nil { // must wait for the real answer
+		t.Fatalf("Negotiate: %v", err)
+	}
+	if len(offers) != 0 {
+		t.Fatal("new offer sent while the first one is still unanswered")
+	}
+
+	if err := server.HandleAnswer(clientAnswer(t, client, offer)); err != nil {
+		t.Fatalf("valid answer after a bad one: %v", err)
+	}
+	if len(offers) != 1 {
+		t.Errorf("got %d follow-up offers, want 1", len(offers))
+	}
+}
+
+func TestNegotiateWithoutOfferHandlerFails(t *testing.T) {
+	server, _ := newTestPeer(t)
+	if err := server.Negotiate(); !errors.Is(err, ErrNoOfferHandler) {
+		t.Fatalf("err = %v, want ErrNoOfferHandler", err)
+	}
+	// Negotiation is not blocked: after registering a handler, an offer is sent.
+	offers := make(chan webrtc.SessionDescription, 1)
+	server.OnOffer(func(o webrtc.SessionDescription) { offers <- o })
+	if _, err := server.AddTrack(newVideoTrack(t, "v1")); err != nil {
+		t.Fatalf("AddTrack: %v", err)
+	}
+	if err := server.Negotiate(); err != nil {
+		t.Fatalf("Negotiate: %v", err)
+	}
+	if len(offers) != 1 {
+		t.Error("no offer after registering a handler")
 	}
 }

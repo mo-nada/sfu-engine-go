@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"sync"
 
+	"github.com/pion/rtcp"
 	"github.com/pion/webrtc/v4"
 )
 
@@ -14,11 +15,15 @@ import (
 // while waiting for the remote description.
 const maxPendingCandidates = 64
 
-// ErrTooManyPendingCandidates is returned when the pending candidate queue is full.
-var ErrTooManyPendingCandidates = errors.New("too many ICE candidates before remote description")
+var (
+	// ErrTooManyPendingCandidates is returned when the pending candidate queue is full.
+	ErrTooManyPendingCandidates = errors.New("too many ICE candidates before remote description")
+	// ErrNoOfferHandler is returned by Negotiate when no OnOffer callback is registered.
+	ErrNoOfferHandler = errors.New("no OnOffer handler registered")
+)
 
 // Peer wraps one PeerConnection. It negotiates as either side (HandleOffer
-// when the client offers, CreateOffer/HandleAnswer when the server offers),
+// when the client offers, Negotiate/HandleAnswer when the server offers),
 // queues early ICE candidates, logs state changes, and reports closure once.
 type Peer struct {
 	id     string
@@ -29,6 +34,12 @@ type Peer struct {
 	remoteSet bool
 	pending   []webrtc.ICECandidateInit
 	onClose   func()
+
+	// negMu guards server-side negotiation (Negotiate/HandleAnswer).
+	negMu              sync.Mutex
+	onOffer            func(webrtc.SessionDescription)
+	offerInFlight      bool
+	negotiationPending bool
 
 	closeOnce sync.Once
 	closeErr  error
@@ -106,33 +117,110 @@ func (p *Peer) HandleOffer(offer webrtc.SessionDescription) (webrtc.SessionDescr
 	return answer, nil
 }
 
-// CreateOffer creates a local offer, applies it, and returns it.
-// It is used when the server starts negotiation (the subscribe direction).
-func (p *Peer) CreateOffer() (webrtc.SessionDescription, error) {
-	offer, err := p.pc.CreateOffer(nil)
-	if err != nil {
-		return webrtc.SessionDescription{}, fmt.Errorf("create offer: %w", err)
-	}
-	if err := p.pc.SetLocalDescription(offer); err != nil {
-		return webrtc.SessionDescription{}, fmt.Errorf("set local description: %w", err)
-	}
-
-	p.logger.Debug("offer created")
-	return offer, nil
+// OnOffer registers f to receive offers created by Negotiate. The caller must
+// deliver each offer to the client and pass the reply to HandleAnswer.
+func (p *Peer) OnOffer(f func(webrtc.SessionDescription)) {
+	p.negMu.Lock()
+	defer p.negMu.Unlock()
+	p.onOffer = f
 }
 
-// HandleAnswer applies the remote answer to an offer from CreateOffer.
+// Negotiate starts a server-side offer (the subscribe direction), for example
+// after AddTrack or RemoveTrack. The offer is passed to the OnOffer callback.
+//
+// Only one offer is in flight at a time: if an offer is still waiting for its
+// answer, Negotiate only records that another round is needed, and
+// HandleAnswer starts it. Many calls while waiting give one follow-up offer.
+func (p *Peer) Negotiate() error {
+	p.negMu.Lock()
+	// Without a handler the offer could never be answered and negotiation
+	// would stay blocked, so refuse before creating it.
+	if p.onOffer == nil {
+		p.negMu.Unlock()
+		return ErrNoOfferHandler
+	}
+	if p.offerInFlight {
+		p.negotiationPending = true
+		p.negMu.Unlock()
+		return nil
+	}
+
+	offer, err := p.pc.CreateOffer(nil)
+	if err != nil {
+		p.negMu.Unlock()
+		return fmt.Errorf("create offer: %w", err)
+	}
+	if err := p.pc.SetLocalDescription(offer); err != nil {
+		p.negMu.Unlock()
+		return fmt.Errorf("set local description: %w", err)
+	}
+	p.offerInFlight = true
+	onOffer := p.onOffer
+	p.negMu.Unlock()
+
+	p.logger.Debug("offer created")
+	onOffer(offer)
+	return nil
+}
+
+// HandleAnswer applies the remote answer to the offer from Negotiate, then
+// starts the next offer if one was requested meanwhile.
+//
+// If the answer is rejected, the offer stays in flight, so a corrected answer
+// can still be applied. Pion v4 cannot roll back a local offer, so a client
+// that never sends a valid answer blocks further offers on this peer; callers
+// should treat a rejected answer as a protocol error and close the peer.
 func (p *Peer) HandleAnswer(answer webrtc.SessionDescription) error {
 	if answer.Type != webrtc.SDPTypeAnswer {
 		return fmt.Errorf("expected answer, got %s", answer.Type)
 	}
+
+	p.negMu.Lock()
 	if err := p.pc.SetRemoteDescription(answer); err != nil {
+		p.negMu.Unlock()
 		return fmt.Errorf("set remote description: %w", err)
 	}
-	p.flushPendingCandidates()
+	p.offerInFlight = false
+	again := p.negotiationPending
+	p.negotiationPending = false
+	p.negMu.Unlock()
 
+	p.flushPendingCandidates()
 	p.logger.Debug("answer applied")
+
+	if again {
+		return p.Negotiate()
+	}
 	return nil
+}
+
+// OnTrack registers f to be called when the client starts sending a track
+// (the publish direction).
+func (p *Peer) OnTrack(f func(*webrtc.TrackRemote, *webrtc.RTPReceiver)) {
+	p.pc.OnTrack(f)
+}
+
+// AddTrack attaches a local track to send to the client. Call Negotiate
+// afterwards so the client learns about it.
+func (p *Peer) AddTrack(track webrtc.TrackLocal) (*webrtc.RTPSender, error) {
+	sender, err := p.pc.AddTrack(track)
+	if err != nil {
+		return nil, fmt.Errorf("add track: %w", err)
+	}
+	return sender, nil
+}
+
+// RemoveTrack stops sending the track of sender. Call Negotiate afterwards.
+func (p *Peer) RemoveTrack(sender *webrtc.RTPSender) error {
+	if err := p.pc.RemoveTrack(sender); err != nil {
+		return fmt.Errorf("remove track: %w", err)
+	}
+	return nil
+}
+
+// WriteRTCP sends RTCP packets, for example a PLI keyframe request, to the client.
+func (p *Peer) WriteRTCP(pkts []rtcp.Packet) error {
+	return p.pc.WriteRTCP(pkts)
 }
 
 // AddICECandidate adds a remote ICE candidate. Candidates that arrive before
