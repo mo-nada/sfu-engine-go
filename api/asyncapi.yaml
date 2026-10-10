@@ -1,0 +1,275 @@
+asyncapi: 3.0.0
+info:
+  title: SFU Engine Signaling API
+  version: 0.2.0
+  description: |
+    WebSocket signaling protocol of the Go WebRTC SFU engine.
+
+    **Connections.** Each participant uses two RTCPeerConnections:
+    - **publisher**: the client offers and sends its media to the SFU.
+    - **subscriber**: the SFU offers and sends the other participants' media.
+
+    **Flow.**
+    1. Send `join` as the first message. The server replies with `joined`,
+       which lists the others already in the room, and then sends a
+       subscriber `offer`. Answer every subscriber `offer` with an `answer`.
+    2. To publish, add tracks to the publisher connection and send `offer`
+       with a `tracks` map (track ID → source). The server replies with
+       `answer`. To stop a track, remove it and send a new `offer`.
+    3. Exchange `candidate` messages for both connections (trickle ICE).
+    4. Report mute changes with `mute`. Others receive `mute`,
+       `participant-joined` and `participant-left`.
+
+    **Stream IDs.** A forwarded track's stream ID is
+    `<participant>/media` (camera and microphone) or
+    `<participant>/screen` (screen and screen audio).
+
+    **Errors.** An invalid subscriber `answer`, `leave`, a failed
+    PeerConnection, no pong for 60 s, a message over 64 KB, or a client too
+    slow to read its messages close the connection. Other mistakes get an
+    `error` message, and the connection stays open.
+servers:
+  local:
+    host: localhost:8080
+    pathname: /ws
+    protocol: ws
+    description: Local development server.
+channels:
+  signaling:
+    address: /ws
+    messages:
+      join: { $ref: '#/components/messages/join' }
+      joined: { $ref: '#/components/messages/joined' }
+      participantJoined: { $ref: '#/components/messages/participantJoined' }
+      participantLeft: { $ref: '#/components/messages/participantLeft' }
+      publisherOffer: { $ref: '#/components/messages/publisherOffer' }
+      publisherAnswer: { $ref: '#/components/messages/publisherAnswer' }
+      subscriberOffer: { $ref: '#/components/messages/subscriberOffer' }
+      subscriberAnswer: { $ref: '#/components/messages/subscriberAnswer' }
+      clientCandidate: { $ref: '#/components/messages/candidate' }
+      serverCandidate: { $ref: '#/components/messages/candidate' }
+      muteRequest: { $ref: '#/components/messages/muteRequest' }
+      muteEvent: { $ref: '#/components/messages/muteEvent' }
+      leave: { $ref: '#/components/messages/leave' }
+      error: { $ref: '#/components/messages/error' }
+operations:
+  sendToServer:
+    action: send
+    summary: Messages the client sends.
+    channel: { $ref: '#/channels/signaling' }
+    messages:
+      - $ref: '#/channels/signaling/messages/join'
+      - $ref: '#/channels/signaling/messages/publisherOffer'
+      - $ref: '#/channels/signaling/messages/subscriberAnswer'
+      - $ref: '#/channels/signaling/messages/clientCandidate'
+      - $ref: '#/channels/signaling/messages/muteRequest'
+      - $ref: '#/channels/signaling/messages/leave'
+  receiveFromServer:
+    action: receive
+    summary: Messages the server sends.
+    channel: { $ref: '#/channels/signaling' }
+    messages:
+      - $ref: '#/channels/signaling/messages/joined'
+      - $ref: '#/channels/signaling/messages/participantJoined'
+      - $ref: '#/channels/signaling/messages/participantLeft'
+      - $ref: '#/channels/signaling/messages/publisherAnswer'
+      - $ref: '#/channels/signaling/messages/subscriberOffer'
+      - $ref: '#/channels/signaling/messages/serverCandidate'
+      - $ref: '#/channels/signaling/messages/muteEvent'
+      - $ref: '#/channels/signaling/messages/error'
+components:
+  schemas:
+    id:
+      type: string
+      pattern: '^[A-Za-z0-9_-]{1,64}$'
+      description: Room or participant ID.
+    source:
+      type: string
+      enum: [camera, microphone, screen, screen-audio]
+      description: What a track carries.
+    participantInfo:
+      type: object
+      required: [id]
+      properties:
+        id: { $ref: '#/components/schemas/id' }
+        muted:
+          type: object
+          description: Sources the participant reported, mapped to whether they are muted.
+          additionalProperties: { type: boolean }
+          example: { microphone: true }
+    iceCandidate:
+      type: object
+      description: RTCIceCandidateInit, as produced by `candidate.toJSON()` in browsers.
+      required: [candidate]
+      properties:
+        candidate: { type: string }
+        sdpMid: { type: [string, 'null'] }
+        sdpMLineIndex: { type: [integer, 'null'] }
+        usernameFragment: { type: [string, 'null'] }
+  messages:
+    join:
+      name: join
+      title: Join a room (client → server)
+      summary: Must be the first message. The participant ID must be unique in the room.
+      payload:
+        type: object
+        required: [type, room, participant]
+        properties:
+          type: { const: join }
+          room: { $ref: '#/components/schemas/id' }
+          participant: { $ref: '#/components/schemas/id' }
+      examples:
+        - payload: { type: join, room: room1, participant: alice }
+    joined:
+      name: joined
+      title: Join accepted (server → client)
+      summary: Lists the other participants already in the room. A subscriber offer follows.
+      payload:
+        type: object
+        required: [type, room, participant, participants]
+        properties:
+          type: { const: joined }
+          room: { $ref: '#/components/schemas/id' }
+          participant: { $ref: '#/components/schemas/id' }
+          participants:
+            type: array
+            items: { $ref: '#/components/schemas/participantInfo' }
+      examples:
+        - payload:
+            type: joined
+            room: room1
+            participant: bob
+            participants: [{ id: alice, muted: { microphone: true } }]
+    participantJoined:
+      name: participant-joined
+      title: Another participant joined (server → client)
+      payload:
+        type: object
+        required: [type, participant]
+        properties:
+          type: { const: participant-joined }
+          participant: { $ref: '#/components/schemas/id' }
+      examples:
+        - payload: { type: participant-joined, participant: carol }
+    participantLeft:
+      name: participant-left
+      title: Another participant left (server → client)
+      payload:
+        type: object
+        required: [type, participant]
+        properties:
+          type: { const: participant-left }
+          participant: { $ref: '#/components/schemas/id' }
+      examples:
+        - payload: { type: participant-left, participant: carol }
+    publisherOffer:
+      name: offer
+      title: Publisher offer (client → server)
+      summary: Offer on the publisher connection. Send a new one whenever tracks are added or removed.
+      payload:
+        type: object
+        required: [type, sdp]
+        properties:
+          type: { const: offer }
+          sdp: { type: string }
+          tracks:
+            type: object
+            description: |
+              Track ID (MediaStreamTrack.id) → source, for every track in the
+              offer, at most 16. Missing entries default to camera for video
+              and microphone for audio.
+            additionalProperties: { $ref: '#/components/schemas/source' }
+      examples:
+        - payload:
+            type: offer
+            sdp: "v=0\r\n..."
+            tracks: { "3f1c...": camera, "9a2b...": microphone }
+    publisherAnswer:
+      name: answer
+      title: Answer to the publisher offer (server → client)
+      payload:
+        type: object
+        required: [type, sdp]
+        properties:
+          type: { const: answer }
+          sdp: { type: string }
+    subscriberOffer:
+      name: offer
+      title: Subscriber offer (server → client)
+      summary: Sent after joining and whenever forwarded tracks are added or removed.
+      payload:
+        type: object
+        required: [type, sdp]
+        properties:
+          type: { const: offer }
+          sdp: { type: string }
+    subscriberAnswer:
+      name: answer
+      title: Answer to a subscriber offer (client → server)
+      summary: An invalid answer closes the connection.
+      payload:
+        type: object
+        required: [type, sdp]
+        properties:
+          type: { const: answer }
+          sdp: { type: string }
+    candidate:
+      name: candidate
+      title: ICE candidate (both directions)
+      payload:
+        type: object
+        required: [type, target, candidate]
+        properties:
+          type: { const: candidate }
+          target: { type: string, enum: [publisher, subscriber] }
+          candidate: { $ref: '#/components/schemas/iceCandidate' }
+      examples:
+        - payload:
+            type: candidate
+            target: publisher
+            candidate: { candidate: "candidate:1 1 udp 2130706431 192.168.1.5 50000 typ host", sdpMid: "0", sdpMLineIndex: 0 }
+    muteRequest:
+      name: mute
+      title: Report a mute change (client → server)
+      payload:
+        type: object
+        required: [type, source, muted]
+        properties:
+          type: { const: mute }
+          source: { $ref: '#/components/schemas/source' }
+          muted: { type: boolean }
+      examples:
+        - payload: { type: mute, source: microphone, muted: true }
+    muteEvent:
+      name: mute
+      title: Another participant's mute change (server → client)
+      payload:
+        type: object
+        required: [type, participant, source, muted]
+        properties:
+          type: { const: mute }
+          participant: { $ref: '#/components/schemas/id' }
+          source: { $ref: '#/components/schemas/source' }
+          muted: { type: boolean }
+      examples:
+        - payload: { type: mute, participant: alice, source: camera, muted: true }
+    leave:
+      name: leave
+      title: Leave the room (client → server)
+      summary: The server closes the connection.
+      payload:
+        type: object
+        required: [type]
+        properties:
+          type: { const: leave }
+    error:
+      name: error
+      title: Request failed (server → client)
+      payload:
+        type: object
+        required: [type, message]
+        properties:
+          type: { const: error }
+          message: { type: string }
+      examples:
+        - payload: { type: error, message: participant already in room }

@@ -20,11 +20,11 @@ func discardLogger() *slog.Logger { return slog.New(slog.NewTextHandler(io.Disca
 func TestJoinAndLeave(t *testing.T) {
 	m := NewManager(discardLogger())
 
-	r, err := m.Join("r1", NewParticipant("alice", nil, nil))
+	r, err := m.Join("r1", NewParticipant("alice", nil, nil, nil))
 	if err != nil {
 		t.Fatalf("Join alice: %v", err)
 	}
-	if _, err := m.Join("r1", NewParticipant("bob", nil, nil)); err != nil {
+	if _, err := m.Join("r1", NewParticipant("bob", nil, nil, nil)); err != nil {
 		t.Fatalf("Join bob: %v", err)
 	}
 	if got := len(r.Participants()); got != 2 {
@@ -50,24 +50,24 @@ func TestJoinAndLeave(t *testing.T) {
 
 func TestDuplicateParticipantRejected(t *testing.T) {
 	m := NewManager(discardLogger())
-	if _, err := m.Join("r1", NewParticipant("alice", nil, nil)); err != nil {
+	if _, err := m.Join("r1", NewParticipant("alice", nil, nil, nil)); err != nil {
 		t.Fatalf("Join: %v", err)
 	}
-	if _, err := m.Join("r1", NewParticipant("alice", nil, nil)); !errors.Is(err, ErrDuplicateParticipant) {
+	if _, err := m.Join("r1", NewParticipant("alice", nil, nil, nil)); !errors.Is(err, ErrDuplicateParticipant) {
 		t.Errorf("err = %v, want ErrDuplicateParticipant", err)
 	}
 	// The same ID in another room is fine.
-	if _, err := m.Join("r2", NewParticipant("alice", nil, nil)); err != nil {
+	if _, err := m.Join("r2", NewParticipant("alice", nil, nil, nil)); err != nil {
 		t.Errorf("Join other room: %v", err)
 	}
 }
 
 func TestRejoinAfterRoomRemovedCreatesNewRoom(t *testing.T) {
 	m := NewManager(discardLogger())
-	first, _ := m.Join("r1", NewParticipant("alice", nil, nil))
+	first, _ := m.Join("r1", NewParticipant("alice", nil, nil, nil))
 	m.Leave("r1", "alice")
 
-	second, err := m.Join("r1", NewParticipant("alice", nil, nil))
+	second, err := m.Join("r1", NewParticipant("alice", nil, nil, nil))
 	if err != nil {
 		t.Fatalf("rejoin: %v", err)
 	}
@@ -79,7 +79,7 @@ func TestRejoinAfterRoomRemovedCreatesNewRoom(t *testing.T) {
 func TestLeaveUnknownIsNoop(t *testing.T) {
 	m := NewManager(discardLogger())
 	m.Leave("missing", "nobody")
-	_, _ = m.Join("r1", NewParticipant("alice", nil, nil))
+	_, _ = m.Join("r1", NewParticipant("alice", nil, nil, nil))
 	m.Leave("r1", "nobody")
 	if _, ok := m.Room("r1"); !ok {
 		t.Error("room removed by leaving an unknown participant")
@@ -95,7 +95,7 @@ func TestConcurrentJoinLeave(t *testing.T) {
 			defer wg.Done()
 			id := fmt.Sprintf("p%d", i)
 			roomID := fmt.Sprintf("r%d", i%3)
-			if _, err := m.Join(roomID, NewParticipant(id, nil, nil)); err != nil {
+			if _, err := m.Join(roomID, NewParticipant(id, nil, nil, nil)); err != nil {
 				t.Errorf("Join %s: %v", id, err)
 				return
 			}
@@ -117,8 +117,8 @@ func TestConcurrentJoinLeave(t *testing.T) {
 func TestCloseClosesEveryone(t *testing.T) {
 	m := NewManager(discardLogger())
 	pub, sub := newPeer(t), newPeer(t)
-	_, _ = m.Join("r1", NewParticipant("alice", pub, sub))
-	_, _ = m.Join("r2", NewParticipant("bob", nil, nil))
+	_, _ = m.Join("r1", NewParticipant("alice", pub, sub, nil))
+	_, _ = m.Join("r2", NewParticipant("bob", nil, nil, nil))
 
 	m.Close()
 
@@ -130,7 +130,7 @@ func TestCloseClosesEveryone(t *testing.T) {
 			t.Errorf("peer state = %s, want closed", p.ConnectionState())
 		}
 	}
-	if _, err := m.Join("r1", NewParticipant("carol", nil, nil)); !errors.Is(err, ErrManagerClosed) {
+	if _, err := m.Join("r1", NewParticipant("carol", nil, nil, nil)); !errors.Is(err, ErrManagerClosed) {
 		t.Errorf("Join after Close: err = %v, want ErrManagerClosed", err)
 	}
 }
@@ -140,7 +140,7 @@ func TestCloseClosesEveryone(t *testing.T) {
 func TestPeerCloseTriggersLeave(t *testing.T) {
 	m := NewManager(discardLogger())
 	pub, sub := newPeer(t), newPeer(t)
-	_, _ = m.Join("r1", NewParticipant("alice", pub, sub))
+	_, _ = m.Join("r1", NewParticipant("alice", pub, sub, nil))
 	pub.OnClose(func() { m.Leave("r1", "alice") })
 	sub.OnClose(func() { m.Leave("r1", "alice") })
 
@@ -175,4 +175,70 @@ func newPeer(t *testing.T) *peer.Peer {
 	}
 	t.Cleanup(func() { _ = p.Close() })
 	return p
+}
+
+// recorder is a Notifier that keeps every event.
+type recorder struct {
+	mu     sync.Mutex
+	events []Event
+}
+
+func (r *recorder) notify(e Event) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.events = append(r.events, e)
+}
+
+func (r *recorder) all() []Event {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return append([]Event(nil), r.events...)
+}
+
+func TestRosterJoinLeaveAndMuteEvents(t *testing.T) {
+	m := NewManager(discardLogger())
+	alice, bob := &recorder{}, &recorder{}
+
+	if _, err := m.Join("r1", NewParticipant("alice", nil, nil, alice.notify)); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.SetMuted("r1", "alice", "microphone", true); err != nil {
+		t.Fatalf("SetMuted: %v", err)
+	}
+	if _, err := m.Join("r1", NewParticipant("bob", nil, nil, bob.notify)); err != nil {
+		t.Fatal(err)
+	}
+
+	// Bob's roster shows alice with her microphone muted.
+	got := bob.all()
+	if len(got) != 1 || got[0].Kind != EventRoster || len(got[0].Roster) != 1 ||
+		got[0].Roster[0].ID != "alice" || !got[0].Roster[0].Muted["microphone"] {
+		t.Fatalf("bob events = %+v, want roster with muted alice", got)
+	}
+
+	if err := m.SetMuted("r1", "bob", "camera", true); err != nil {
+		t.Fatalf("SetMuted: %v", err)
+	}
+	m.Leave("r1", "bob")
+
+	want := []Event{
+		{Kind: EventRoster, Roster: []ParticipantInfo{}},
+		{Kind: EventJoined, Participant: "bob"},
+		{Kind: EventMuted, Participant: "bob", Source: "camera", Muted: true},
+		{Kind: EventLeft, Participant: "bob"},
+	}
+	got = alice.all()
+	if len(got) != len(want) {
+		t.Fatalf("alice events = %+v, want %+v", got, want)
+	}
+	for i := range want {
+		if got[i].Kind != want[i].Kind || got[i].Participant != want[i].Participant ||
+			got[i].Source != want[i].Source || got[i].Muted != want[i].Muted {
+			t.Errorf("alice event %d = %+v, want %+v", i, got[i], want[i])
+		}
+	}
+
+	if err := m.SetMuted("r1", "nobody", "camera", true); !errors.Is(err, ErrNotInRoom) {
+		t.Errorf("SetMuted unknown: err = %v, want ErrNotInRoom", err)
+	}
 }

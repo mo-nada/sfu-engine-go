@@ -51,6 +51,19 @@ func (r *Room) Participants() []*Participant {
 	return out
 }
 
+// othersThan returns every participant except id.
+func (r *Room) othersThan(id string) []*Participant {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	out := make([]*Participant, 0, len(r.participants))
+	for pid, p := range r.participants {
+		if pid != id {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
 // add inserts p. It reports false if the ID is already taken.
 func (r *Room) add(p *Participant) bool {
 	r.mu.Lock()

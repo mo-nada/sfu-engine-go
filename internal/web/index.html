@@ -5,38 +5,59 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>SFU Engine – Room</title>
 <style>
-  :root { color-scheme: light dark; font-family: system-ui, sans-serif; }
-  body { margin: 0; padding: 1rem; max-width: 1100px; margin-inline: auto; }
-  h1 { font-size: 1.3rem; margin: 0 0 1rem; }
+  :root { color-scheme: light dark; font-family: system-ui, sans-serif; --accent: #2563eb; --danger: #dc2626; }
+  body { margin: 0; padding: 1rem 1rem 6rem; max-width: 1200px; margin-inline: auto; }
+  h1 { font-size: 1.3rem; margin: 0 0 1rem; display: flex; justify-content: space-between; align-items: baseline; }
+  h1 a { font-size: .85rem; font-weight: normal; }
   form { display: flex; gap: .5rem; flex-wrap: wrap; align-items: end; margin-bottom: 1rem; }
   label { display: flex; flex-direction: column; font-size: .85rem; gap: .2rem; }
-  input { padding: .45rem .6rem; font-size: 1rem; border: 1px solid #8888; border-radius: 6px; }
-  button { padding: .5rem 1rem; font-size: 1rem; border: 0; border-radius: 6px; cursor: pointer; }
-  button[type=submit] { background: #2563eb; color: #fff; }
-  #leave { background: #dc2626; color: #fff; }
+  input, select { padding: .45rem .6rem; font-size: 1rem; border: 1px solid #8888; border-radius: 6px; }
+  button { padding: .55rem 1rem; font-size: .95rem; border: 0; border-radius: 999px; cursor: pointer; background: #8883; }
+  button.primary { background: var(--accent); color: #fff; }
+  button.off { background: var(--danger); color: #fff; }
+  button.on { background: var(--accent); color: #fff; }
   button:disabled { opacity: .5; cursor: default; }
   #status { font-size: .9rem; margin-bottom: 1rem; }
-  #videos { display: grid; grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); gap: .75rem; }
-  figure { margin: 0; background: #000; border-radius: 8px; overflow: hidden; position: relative; aspect-ratio: 4 / 3; }
+  #screens { display: grid; gap: .75rem; margin-bottom: .75rem; }
+  #screens figure { aspect-ratio: 16 / 9; }
+  #people { display: grid; grid-template-columns: repeat(auto-fill, minmax(260px, 1fr)); gap: .75rem; }
+  figure { margin: 0; background: #111; border-radius: 10px; overflow: hidden; position: relative; aspect-ratio: 4 / 3; }
   video { width: 100%; height: 100%; object-fit: cover; display: block; }
+  #screens video { object-fit: contain; }
+  .avatar { position: absolute; inset: 0; display: none; place-items: center; font-size: 3rem; color: #fff;
+            background: #334; }
+  figure.camera-off .avatar { display: grid; }
   figcaption { position: absolute; left: .5rem; bottom: .4rem; color: #fff; font-size: .85rem;
-               background: #0008; padding: .1rem .4rem; border-radius: 4px; }
+               background: #0009; padding: .15rem .5rem; border-radius: 4px; }
+  figcaption .mic { margin-left: .3rem; }
+  #controls { position: fixed; left: 0; right: 0; bottom: 0; display: none; gap: .5rem; justify-content: center;
+              flex-wrap: wrap; padding: .75rem; background: #8882; backdrop-filter: blur(8px); }
+  #controls.visible { display: flex; }
   details { margin-top: 1rem; font-size: .8rem; }
   #log { max-height: 220px; overflow: auto; background: #8881; padding: .5rem; white-space: pre-wrap; }
 </style>
 </head>
 <body>
-<h1>SFU Engine – join a room</h1>
+<h1>SFU Engine – room <a href="/docs">API docs</a></h1>
 
 <form id="join-form">
   <label>Room <input id="room" required pattern="[A-Za-z0-9_\-]{1,64}" value="room1"></label>
   <label>Your name <input id="name" required pattern="[A-Za-z0-9_\-]{1,64}" placeholder="alice"></label>
-  <button type="submit" id="join">Join</button>
-  <button type="button" id="leave" disabled>Leave</button>
+  <button type="submit" id="join" class="primary">Join</button>
 </form>
 <div id="status">Not connected. Names: letters, digits, "-" or "_".</div>
 
-<div id="videos"></div>
+<div id="screens"></div>
+<div id="people"></div>
+
+<div id="controls">
+  <button id="mic" title="Turn microphone on or off">🎤 Mic</button>
+  <button id="cam" title="Turn camera on or off">📷 Camera</button>
+  <button id="screen" title="Share your screen">🖥️ Share screen</button>
+  <select id="mic-select" title="Microphone"></select>
+  <select id="cam-select" title="Camera"></select>
+  <button id="leave" class="off">Leave</button>
+</div>
 
 <details>
   <summary>Log</summary>
@@ -45,14 +66,21 @@
 
 <script>
 "use strict";
-// Protocol: see README "Signaling protocol". Two PeerConnections per client:
-// "publisher" (we offer, we send our camera) and "subscriber" (the SFU offers,
-// we receive everyone else's video).
+// Protocol: /docs/signaling. Two PeerConnections: "publisher" (we offer and
+// send camera, microphone, screen) and "subscriber" (the SFU offers and sends
+// everyone else). Forwarded stream IDs are "<name>/media" or "<name>/screen".
 
 const $ = (id) => document.getElementById(id);
-let ws, pub, sub, localStream, joined = false;
-const pending = { publisher: [], subscriber: [] }; // ICE candidates before remote description
-const remoteTiles = new Map(); // participant -> {fig, stream}
+const state = {
+  ws: null, pub: null, sub: null, me: "", joined: false,
+  pending: { publisher: [], subscriber: [] }, // ICE candidates before remote description
+  senders: {},        // source -> RTCRtpSender on the publisher connection
+  tracks: {},         // source -> local MediaStreamTrack being sent
+  micMuted: false, camOff: false,
+  negotiating: false, negotiateAgain: false,
+  messages: Promise.resolve(), // handle server messages one at a time, in order
+};
+const people = new Map(); // name -> { fig, video, muted: {} }
 
 function log(...args) {
   const line = new Date().toLocaleTimeString() + " " + args.join(" ");
@@ -60,28 +88,67 @@ function log(...args) {
   $("log").textContent += line + "\n";
 }
 function setStatus(text) { $("status").textContent = text; }
-function send(msg) { if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(msg)); }
+function send(msg) { if (state.ws?.readyState === WebSocket.OPEN) state.ws.send(JSON.stringify(msg)); }
 
-function addTile(id, label, stream, muted) {
-  let fig = document.getElementById("tile-" + id);
+// ---------- tiles ----------
+
+function personTile(name, label) {
+  let p = people.get(name);
+  if (p) return p;
+  const fig = document.createElement("figure");
+  const video = document.createElement("video");
+  video.autoplay = true;
+  video.playsInline = true;
+  video.muted = name === state.me; // never play our own microphone back
+  const avatar = document.createElement("div");
+  avatar.className = "avatar";
+  avatar.textContent = name.slice(0, 1).toUpperCase();
+  const cap = document.createElement("figcaption");
+  cap.innerHTML = `<span class="who"></span><span class="mic"></span>`;
+  cap.querySelector(".who").textContent = label || name;
+  fig.append(video, avatar, cap);
+  fig.classList.add("camera-off"); // until video arrives
+  $("people").append(fig);
+  p = { fig, video, muted: {} };
+  people.set(name, p);
+  return p;
+}
+
+function updateTile(name) {
+  const p = people.get(name);
+  if (!p) return;
+  const hasVideo = p.video.srcObject?.getVideoTracks().some((t) => t.readyState === "live");
+  p.fig.classList.toggle("camera-off", !!p.muted.camera || !hasVideo);
+  p.fig.querySelector(".mic").textContent = p.muted.microphone ? "🔇" : "";
+}
+
+function removePerson(name) {
+  people.get(name)?.fig.remove();
+  people.delete(name);
+  document.getElementById("screen-" + name)?.remove();
+}
+
+function screenTile(name, stream) {
+  let fig = document.getElementById("screen-" + name);
   if (!fig) {
     fig = document.createElement("figure");
-    fig.id = "tile-" + id;
+    fig.id = "screen-" + name;
     const video = document.createElement("video");
     video.autoplay = true;
     video.playsInline = true;
-    video.muted = muted;
+    video.muted = name === state.me;
     const cap = document.createElement("figcaption");
-    cap.textContent = label;
+    cap.textContent = (name === state.me ? "You" : name) + " – screen";
     fig.append(video, cap);
-    $("videos").append(fig);
+    $("screens").append(fig);
   }
   fig.querySelector("video").srcObject = stream;
 }
-function removeTile(id) { document.getElementById("tile-" + id)?.remove(); }
+
+// ---------- signaling ----------
 
 function newPC(target) {
-  const pc = new RTCPeerConnection(); // no STUN needed on the same machine/LAN
+  const pc = new RTCPeerConnection(); // no STUN needed on the same machine or LAN
   pc.onicecandidate = (e) => {
     if (e.candidate) send({ type: "candidate", target, candidate: e.candidate.toJSON() });
   };
@@ -91,93 +158,298 @@ function newPC(target) {
 
 async function setRemote(target, pc, desc) {
   await pc.setRemoteDescription(desc);
-  for (const c of pending[target].splice(0)) await pc.addIceCandidate(c).catch((e) => log("candidate error", e));
+  for (const c of state.pending[target].splice(0)) await pc.addIceCandidate(c).catch((e) => log("candidate error", e));
 }
 
 async function onMessage(msg) {
   switch (msg.type) {
     case "joined":
-      joined = true;
+      state.joined = true;
       setStatus(`In room "${msg.room}" as "${msg.participant}".`);
       log("joined", msg.room, "as", msg.participant);
-      await publish();
+      for (const p of msg.participants || []) {
+        personTile(p.id).muted = p.muted || {};
+        updateTile(p.id);
+      }
+      if (Object.keys(state.senders).length > 0) await negotiate(); // nothing to publish without devices
       break;
+    case "participant-joined":
+      log(msg.participant, "joined");
+      personTile(msg.participant);
+      break;
+    case "participant-left":
+      log(msg.participant, "left");
+      removePerson(msg.participant);
+      break;
+    case "mute": {
+      const p = personTile(msg.participant);
+      p.muted[msg.source] = msg.muted;
+      updateTile(msg.participant);
+      break;
+    }
     case "answer": // answer to our publisher offer
-      await setRemote("publisher", pub, { type: "answer", sdp: msg.sdp });
+      await setRemote("publisher", state.pub, { type: "answer", sdp: msg.sdp });
+      state.negotiating = false;
+      if (state.negotiateAgain) { state.negotiateAgain = false; await negotiate(); }
       break;
     case "offer": { // the SFU offers on the subscriber connection
-      await setRemote("subscriber", sub, { type: "offer", sdp: msg.sdp });
-      const answer = await sub.createAnswer();
-      await sub.setLocalDescription(answer);
+      await setRemote("subscriber", state.sub, { type: "offer", sdp: msg.sdp });
+      const answer = await state.sub.createAnswer();
+      await state.sub.setLocalDescription(answer);
       send({ type: "answer", sdp: answer.sdp });
       break;
     }
     case "candidate": {
-      const pc = msg.target === "publisher" ? pub : sub;
-      if (!pc.remoteDescription) pending[msg.target].push(msg.candidate);
+      const pc = msg.target === "publisher" ? state.pub : state.sub;
+      if (!pc.remoteDescription) state.pending[msg.target].push(msg.candidate);
       else await pc.addIceCandidate(msg.candidate).catch((e) => log("candidate error", e));
       break;
     }
     case "error":
       log("server error:", msg.message);
-      // Before "joined" (for example, the name is taken) the join failed: reset the form.
-      if (!joined) cleanup("Could not join: " + msg.message);
+      // Before "joined" (for example, the name is taken) the join failed: reset.
+      if (!state.joined) cleanup("Could not join: " + msg.message);
       else setStatus("Error: " + msg.message);
       break;
   }
 }
 
-async function publish() {
-  for (const track of localStream.getTracks()) pub.addTransceiver(track, { direction: "sendonly", streams: [localStream] });
-  const offer = await pub.createOffer();
-  await pub.setLocalDescription(offer);
-  send({ type: "offer", sdp: offer.sdp });
+// negotiate sends a publisher offer describing every track. Only one offer is
+// in flight; a request while waiting runs once the answer arrives.
+async function negotiate() {
+  if (state.negotiating) { state.negotiateAgain = true; return; }
+  state.negotiating = true;
+  const tracks = {};
+  for (const [source, track] of Object.entries(state.tracks)) if (track) tracks[track.id] = source;
+  const offer = await state.pub.createOffer();
+  await state.pub.setLocalDescription(offer);
+  send({ type: "offer", sdp: offer.sdp, tracks });
 }
 
-async function join(room, name) {
-  setStatus("Starting camera…");
-  // Phase 1 forwards video only.
-  localStream = await navigator.mediaDevices.getUserMedia({ video: true, audio: false });
-  addTile("local", name + " (you)", localStream, true);
+// ---------- media ----------
 
-  pub = newPC("publisher");
-  sub = newPC("subscriber");
-  sub.ontrack = (e) => {
-    // The SFU sets the stream ID to the publisher's participant name.
+// addSource starts sending track as source on its own transceiver.
+function addSource(source, track, stream) {
+  const t = state.pub.addTransceiver(track, { direction: "sendonly", streams: [stream] });
+  state.senders[source] = t.sender;
+  state.tracks[source] = track;
+}
+
+async function removeSource(source) {
+  const sender = state.senders[source];
+  if (!sender) return;
+  state.tracks[source]?.stop();
+  state.pub.removeTrack(sender);
+  delete state.senders[source];
+  delete state.tracks[source];
+}
+
+async function getTrack(kind, deviceId) {
+  const constraints = kind === "audio"
+    ? { audio: deviceId ? { deviceId: { exact: deviceId } } : true }
+    : { video: deviceId ? { deviceId: { exact: deviceId } } : true };
+  const stream = await navigator.mediaDevices.getUserMedia(constraints);
+  return stream.getTracks()[0];
+}
+
+// startLocalMedia opens the camera and microphone. Either may be missing.
+async function startLocalMedia() {
+  const local = new MediaStream();
+  for (const [kind, source] of [["audio", "microphone"], ["video", "camera"]]) {
+    try {
+      const track = await getTrack(kind);
+      local.addTrack(track);
+      addSource(source, track, local);
+    } catch (err) {
+      log(`no ${source}:`, err.message);
+      if (source === "camera") state.camOff = true;
+      if (source === "microphone") state.micMuted = true;
+    }
+  }
+  const me = personTile(state.me, state.me + " (you)");
+  me.video.srcObject = local;
+  state.localStream = local;
+  await fillDeviceLists();
+}
+
+async function fillDeviceLists() {
+  const devices = await navigator.mediaDevices.enumerateDevices();
+  for (const [kind, select, source] of [["audioinput", $("mic-select"), "microphone"], ["videoinput", $("cam-select"), "camera"]]) {
+    const current = state.tracks[source]?.getSettings().deviceId;
+    select.replaceChildren(...devices.filter((d) => d.kind === kind).map((d, i) => {
+      const o = document.createElement("option");
+      o.value = d.deviceId;
+      o.textContent = d.label || `${source} ${i + 1}`;
+      o.selected = d.deviceId === current;
+      return o;
+    }));
+  }
+}
+
+async function toggleMic() {
+  if (!state.senders.microphone) {
+    const track = await getTrack("audio", $("mic-select").value);
+    state.localStream.addTrack(track);
+    addSource("microphone", track, state.localStream);
+    state.micMuted = false;
+    await negotiate();
+  } else {
+    state.micMuted = !state.micMuted;
+    state.tracks.microphone.enabled = !state.micMuted; // instant; sends silence while muted
+  }
+  send({ type: "mute", source: "microphone", muted: state.micMuted });
+  people.get(state.me).muted.microphone = state.micMuted;
+  updateControls();
+}
+
+async function toggleCamera() {
+  const me = people.get(state.me);
+  if (!state.camOff) {
+    // Turn the camera off for real (the light goes out); keep the sender for later.
+    const track = state.tracks.camera;
+    await state.senders.camera.replaceTrack(null);
+    track.stop();
+    state.localStream.removeTrack(track);
+    state.camOff = true;
+  } else {
+    const track = await getTrack("video", $("cam-select").value);
+    state.localStream.addTrack(track);
+    if (state.senders.camera) {
+      await state.senders.camera.replaceTrack(track); // same slot, no renegotiation
+      state.tracks.camera = track;
+    } else {
+      addSource("camera", track, state.localStream);
+      await negotiate();
+    }
+    state.camOff = false;
+  }
+  send({ type: "mute", source: "camera", muted: state.camOff });
+  me.muted.camera = state.camOff;
+  me.video.srcObject = state.localStream;
+  updateControls();
+}
+
+async function switchDevice(kind) {
+  const source = kind === "audio" ? "microphone" : "camera";
+  if (!state.senders[source] || (source === "camera" && state.camOff)) return;
+  const track = await getTrack(kind, (kind === "audio" ? $("mic-select") : $("cam-select")).value);
+  if (source === "microphone") track.enabled = !state.micMuted;
+  const old = state.tracks[source];
+  await state.senders[source].replaceTrack(track);
+  state.localStream.removeTrack(old);
+  old.stop();
+  state.localStream.addTrack(track);
+  state.tracks[source] = track;
+  people.get(state.me).video.srcObject = state.localStream;
+  log("switched", source);
+}
+
+async function toggleScreen() {
+  if (state.senders.screen) return stopScreen();
+  const display = await navigator.mediaDevices.getDisplayMedia({ video: true, audio: true });
+  const video = display.getVideoTracks()[0];
+  addSource("screen", video, display);
+  const audio = display.getAudioTracks()[0];
+  if (audio) addSource("screen-audio", audio, display);
+  video.addEventListener("ended", stopScreen); // the browser's own "Stop sharing" button
+  screenTile(state.me, display);
+  await negotiate();
+  updateControls();
+}
+
+async function stopScreen() {
+  if (!state.senders.screen) return;
+  await removeSource("screen");
+  await removeSource("screen-audio");
+  document.getElementById("screen-" + state.me)?.remove();
+  await negotiate();
+  updateControls();
+}
+
+function updateControls() {
+  const mic = $("mic"), cam = $("cam"), screen = $("screen");
+  mic.className = state.micMuted ? "off" : "on";
+  mic.textContent = state.micMuted ? "🔇 Mic off" : "🎤 Mic on";
+  cam.className = state.camOff ? "off" : "on";
+  cam.textContent = state.camOff ? "🚫 Camera off" : "📷 Camera on";
+  screen.className = state.senders.screen ? "on" : "";
+  screen.textContent = state.senders.screen ? "🖥️ Stop sharing" : "🖥️ Share screen";
+  screen.disabled = !navigator.mediaDevices.getDisplayMedia;
+  updateTile(state.me);
+}
+
+// ---------- join / leave ----------
+
+async function join(room, name) {
+  state.me = name;
+  setStatus("Starting camera and microphone…");
+  state.pub = newPC("publisher");
+  state.sub = newPC("subscriber");
+  state.sub.ontrack = (e) => {
     const stream = e.streams[0];
-    const who = stream ? stream.id : "unknown";
-    log("receiving video from", who);
-    addTile("remote-" + who, who, stream, true);
-    stream?.addEventListener("removetrack", () => {
-      if (stream.getTracks().length === 0) { log(who, "left"); removeTile("remote-" + who); }
-    });
+    if (!stream) return;
+    const [who, kind] = stream.id.split("/");
+    log("receiving", e.track.kind, "from", who, kind === "screen" ? "(screen)" : "");
+    if (kind === "screen") {
+      screenTile(who, stream);
+      stream.addEventListener("removetrack", () => {
+        if (stream.getTracks().length === 0) document.getElementById("screen-" + who)?.remove();
+      });
+      return;
+    }
+    const p = personTile(who);
+    p.video.srcObject = stream;
+    e.track.addEventListener("unmute", () => updateTile(who));
+    stream.addEventListener("removetrack", () => updateTile(who));
+    updateTile(who);
+  };
+
+  await startLocalMedia();
+  // Tell the room our starting state, after "joined" (see onMessage).
+  state.afterJoin = () => {
+    if (state.micMuted) send({ type: "mute", source: "microphone", muted: true });
+    if (state.camOff) send({ type: "mute", source: "camera", muted: true });
   };
 
   const proto = location.protocol === "https:" ? "wss" : "ws";
-  ws = new WebSocket(`${proto}://${location.host}/ws`);
-  ws.onopen = () => { setStatus("Joining…"); send({ type: "join", room, participant: name }); };
-  ws.onmessage = (e) => onMessage(JSON.parse(e.data)).catch((err) => log("error:", err));
-  ws.onclose = () => { log("signaling closed"); cleanup("Disconnected."); };
-  setButtons(true);
+  state.ws = new WebSocket(`${proto}://${location.host}/ws`);
+  state.ws.onopen = () => { setStatus("Joining…"); send({ type: "join", room, participant: name }); };
+  state.ws.onmessage = (e) => {
+    const msg = JSON.parse(e.data);
+    state.messages = state.messages
+      .then(() => onMessage(msg))
+      .then(() => { if (msg.type === "joined") state.afterJoin(); })
+      .catch((err) => log("error:", err));
+  };
+  state.ws.onclose = () => { log("signaling closed"); cleanup("Disconnected."); };
+
+  $("controls").classList.add("visible");
+  $("join").disabled = $("room").disabled = $("name").disabled = true;
+  updateControls();
 }
 
 function cleanup(text) {
-  if (ws) { ws.onclose = null; ws.close(); }
-  pub?.close(); sub?.close();
-  joined = false;
-  localStream?.getTracks().forEach((t) => t.stop());
-  ws = pub = sub = localStream = undefined;
-  pending.publisher = []; pending.subscriber = [];
-  $("videos").replaceChildren();
-  setButtons(false);
+  if (state.ws) { state.ws.onclose = null; state.ws.close(); }
+  state.pub?.close();
+  state.sub?.close();
+  state.localStream?.getTracks().forEach((t) => t.stop());
+  Object.values(state.tracks).forEach((t) => t?.stop());
+  Object.assign(state, {
+    ws: null, pub: null, sub: null, joined: false, localStream: null,
+    pending: { publisher: [], subscriber: [] }, senders: {}, tracks: {},
+    micMuted: false, camOff: false, negotiating: false, negotiateAgain: false,
+    messages: Promise.resolve(),
+  });
+  people.clear();
+  $("people").replaceChildren();
+  $("screens").replaceChildren();
+  $("controls").classList.remove("visible");
+  $("join").disabled = $("room").disabled = $("name").disabled = false;
   setStatus(text);
 }
 
-function setButtons(inRoom) {
-  $("join").disabled = inRoom;
-  $("leave").disabled = !inRoom;
-  $("room").disabled = inRoom;
-  $("name").disabled = inRoom;
+function guard(fn) {
+  return () => fn().catch((err) => { log(err.name + ":", err.message); setStatus(err.message); });
 }
 
 $("join-form").addEventListener("submit", (e) => {
@@ -187,6 +459,11 @@ $("join-form").addEventListener("submit", (e) => {
     cleanup("Could not start: " + err.message);
   });
 });
+$("mic").addEventListener("click", guard(toggleMic));
+$("cam").addEventListener("click", guard(toggleCamera));
+$("screen").addEventListener("click", guard(toggleScreen));
+$("mic-select").addEventListener("change", guard(() => switchDevice("audio")));
+$("cam-select").addEventListener("change", guard(() => switchDevice("video")));
 $("leave").addEventListener("click", () => { send({ type: "leave" }); cleanup("You left the room."); });
 window.addEventListener("beforeunload", () => send({ type: "leave" }));
 </script>

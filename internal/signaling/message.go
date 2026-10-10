@@ -4,7 +4,13 @@
 // Every message is a JSON object with a "type" field:
 //
 //	client → server  join       {room, participant}  must be the first message
-//	server → client  joined     {room, participant}
+//	server → client  joined     {room, participant, participants}
+//	                                                 participants: the others already in the
+//	                                                 room, each {id, muted: {source: bool}}
+//	server → client  participant-joined {participant}
+//	server → client  participant-left   {participant}
+//	client → server  mute       {source, muted}      the client muted or unmuted a source
+//	server → client  mute       {participant, source, muted}  another participant did
 //	client → server  offer      {sdp, tracks}        publish connection offer; tracks maps
 //	                                                 track ID → "camera", "microphone",
 //	                                                 "screen" or "screen-audio" for every
@@ -39,6 +45,10 @@ const (
 	TypeCandidate = "candidate"
 	TypeLeave     = "leave"
 	TypeError     = "error"
+
+	TypeParticipantJoined = "participant-joined"
+	TypeParticipantLeft   = "participant-left"
+	TypeMute              = "mute"
 )
 
 // Candidate targets.
@@ -57,6 +67,16 @@ type Message struct {
 	Target      string                   `json:"target,omitempty"`
 	Candidate   *webrtc.ICECandidateInit `json:"candidate,omitempty"`
 	Message     string                   `json:"message,omitempty"`
+	Source      string                   `json:"source,omitempty"`
+	Muted       *bool                    `json:"muted,omitempty"`
+	// Participants is set on "joined"; an empty room gives an empty list.
+	Participants []ParticipantInfo `json:"participants,omitzero"`
+}
+
+// ParticipantInfo describes another participant in a "joined" message.
+type ParticipantInfo struct {
+	ID    string          `json:"id"`
+	Muted map[string]bool `json:"muted,omitempty"`
 }
 
 // maxTracks bounds the size of an offer's tracks map.

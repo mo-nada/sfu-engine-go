@@ -21,7 +21,8 @@ go run ./cmd/sfu
 
 Then open <http://localhost:8080> in two browser tabs (or two browsers). In each tab,
 enter the same room and a different name, then click **Join**. Each tab sends its
-camera, and you see the other tab's video.
+camera and microphone, and you see and hear the other tab. The control bar turns
+the microphone and camera on and off, shares your screen, and switches devices.
 
 The browser only allows camera access on `localhost` or over HTTPS. To test from
 another machine, put the server behind HTTPS (for example, a reverse proxy).
@@ -45,6 +46,14 @@ Set `NO_COLOR=1` to disable colored logs.
 | `GET /` | Browser demo page for joining a room |
 | `GET /ws` | WebSocket signaling |
 | `GET /healthz` | Health check, returns `200 ok` |
+| `GET /docs` | HTTP API documentation (Swagger UI) |
+| `GET /docs/signaling` | Signaling protocol documentation (AsyncAPI viewer) |
+| `GET /api/openapi.yaml` | OpenAPI 3.1 document for the HTTP endpoints |
+| `GET /api/asyncapi.yaml` | AsyncAPI 3.0 document for the WebSocket protocol |
+
+The two `/docs` pages load their viewers from the public unpkg CDN, so the
+browser needs internet access to show them. The YAML documents are served by the
+SFU itself, and other systems can use them to generate clients.
 
 ## Embedding in a Go application
 
@@ -70,55 +79,50 @@ if err := eng.Run(ctx); err != nil {
 
 ## Signaling protocol
 
-Clients connect to `ws://<host>/ws` and exchange JSON messages. Every message has a
-`type` field.
+The full, machine-readable description is in [`api/asyncapi.yaml`](api/asyncapi.yaml)
+(rendered at `/docs/signaling`). In short:
 
-Each participant uses **two RTCPeerConnections**:
+Clients connect to `ws://<host>/ws` and exchange JSON messages. Every message has a
+`type` field. Each participant uses **two RTCPeerConnections**:
 
 - **publisher**: the client offers and sends its media to the SFU.
 - **subscriber**: the SFU offers and sends the other participants' media to the client.
 
-Two connections mean only one side ever starts negotiation on each one, so
-offers can never collide.
+Two connections mean only one side ever starts negotiation on each one, so offers
+can never collide.
 
 | Direction | `type` | Fields | Meaning |
 |---|---|---|---|
 | client → server | `join` | `room`, `participant` | Must be the first message. IDs are 1–64 letters, digits, `-` or `_` |
-| server → client | `joined` | `room`, `participant` | Join accepted. A subscriber `offer` follows |
-| client → server | `offer` | `sdp` | Offer on the **publisher** connection |
+| server → client | `joined` | `room`, `participant`, `participants` | Join accepted. `participants` lists the others: `[{id, muted: {source: bool}}]`. A subscriber `offer` follows |
+| server → client | `participant-joined` / `participant-left` | `participant` | Someone else joined or left |
+| client → server | `offer` | `sdp`, `tracks` | Offer on the **publisher** connection. `tracks` maps each track ID to `camera`, `microphone`, `screen` or `screen-audio` |
 | server → client | `answer` | `sdp` | Answer to that offer |
 | server → client | `offer` | `sdp` | Offer on the **subscriber** connection (initial, and when tracks are added or removed) |
 | client → server | `answer` | `sdp` | Answer to that offer |
 | both ways | `candidate` | `target`, `candidate` | Trickle ICE. `target` is `publisher` or `subscriber` |
+| client → server | `mute` | `source`, `muted` | Report that you muted or unmuted a source |
+| server → client | `mute` | `participant`, `source`, `muted` | Another participant did |
 | client → server | `leave` | none | Leave the room and close the connection |
 | server → client | `error` | `message` | The request failed |
 
-Example session:
+**Stream IDs.** A forwarded track's stream ID is `<participant>/media` for camera
+and microphone (one stream, so players keep them in sync), or
+`<participant>/screen` for screen and screen audio.
 
-```json
-→ {"type":"join","room":"room1","participant":"alice"}
-← {"type":"joined","room":"room1","participant":"alice"}
-← {"type":"offer","sdp":"v=0..."}
-→ {"type":"answer","sdp":"v=0..."}
-→ {"type":"offer","sdp":"v=0..."}
-← {"type":"answer","sdp":"v=0..."}
-→ {"type":"candidate","target":"publisher","candidate":{"candidate":"candidate:...","sdpMid":"0","sdpMLineIndex":0}}
-```
+**Stopping a track** (for example, a screen share): remove it from the publisher
+connection and send a new `offer`. The SFU then removes it from everyone.
 
-Each forwarded track's **stream ID is the publisher's participant name**, so
-clients can label the video.
+**Errors.** These close the connection:
 
-**Errors:**
+- an invalid subscriber `answer`;
+- `leave`;
+- a failed PeerConnection;
+- no pong for 60 seconds;
+- a message over 64 KB;
+- a client too slow to read its messages.
 
-- These close the connection:
-  - an invalid subscriber `answer`, because the subscriber connection could not renegotiate any more;
-  - `leave`;
-  - a failed or closed PeerConnection;
-  - no pong for 60 seconds;
-  - a message larger than 64 KB.
-- Other mistakes (bad JSON, unknown type, invalid IDs, a duplicate name in the
-  room, a message before `join`, a second `join`) get an `error` reply, and the
-  connection stays open.
+Other mistakes get an `error` reply, and the connection stays open.
 
 ## Architecture
 
@@ -133,7 +137,8 @@ internal/room        Manager → Room → Participant lifecycle
 internal/peer        one PeerConnection: negotiation, ICE queueing, close
 internal/sfu         Router: forwards published tracks to subscribers
 internal/transport   Pion API (codecs, interceptors) and ICE config
-internal/web         embedded browser demo page
+internal/web         embedded browser pages: demo client and API doc viewers
+api                  OpenAPI and AsyncAPI documents (embedded and served)
 tests/integration    real clients against the real server
 ```
 
@@ -176,8 +181,6 @@ These are planned for later phases:
 - **Same-origin browsers only.** A web page served from another host cannot
   connect to `/ws`. Non-browser clients are not affected.
 - **No TURN server.** Clients behind strict NATs or firewalls may not connect.
-- **Video only** in the demo page. Audio is forwarded by the router, but it has
-  not been tested yet (Phase 3).
 - **No timeout for an unanswered subscriber offer.** A client that never answers
   gets no further offers until it leaves.
 - **Slow cleanup after a network drop.** When a client's network drops without

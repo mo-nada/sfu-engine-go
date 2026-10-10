@@ -128,7 +128,7 @@ func TestShutdownClosesSignalingAndRooms(t *testing.T) {
 	}
 }
 
-func TestServesDemoPage(t *testing.T) {
+func TestServesPagesAndAPIDocs(t *testing.T) {
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("listen: %v", err)
@@ -147,6 +147,23 @@ func TestServesDemoPage(t *testing.T) {
 	resp.Body.Close()
 	if resp.StatusCode != http.StatusOK || !strings.Contains(string(body), "new WebSocket(") {
 		t.Errorf("GET / = %d, body does not look like the demo page", resp.StatusCode)
+	}
+
+	for path, want := range map[string]string{
+		"/docs":              "SwaggerUIBundle",
+		"/docs/signaling":    "AsyncApiStandalone",
+		"/api/openapi.yaml":  "openapi: 3.1.0",
+		"/api/asyncapi.yaml": "asyncapi: 3.0.0",
+	} {
+		resp, err := http.Get("http://" + ln.Addr().String() + path)
+		if err != nil {
+			t.Fatalf("GET %s: %v", path, err)
+		}
+		body, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusOK || !strings.Contains(string(body), want) {
+			t.Errorf("GET %s = %d, body does not contain %q", path, resp.StatusCode, want)
+		}
 	}
 
 	resp, err = http.Get("http://" + ln.Addr().String() + "/missing")

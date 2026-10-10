@@ -7,6 +7,8 @@ package room
 
 import (
 	"errors"
+	"maps"
+	"sync"
 
 	"github.com/mo-nada/sfu-engine/internal/peer"
 )
@@ -18,12 +20,34 @@ type Participant struct {
 	id         string
 	publisher  *peer.Peer
 	subscriber *peer.Peer
+	notify     Notifier
+
+	mu    sync.Mutex
+	muted map[string]bool // source -> muted
 }
 
 // NewParticipant creates a participant. Either peer may be nil if it has not
-// been created yet.
-func NewParticipant(id string, publisher, subscriber *peer.Peer) *Participant {
-	return &Participant{id: id, publisher: publisher, subscriber: subscriber}
+// been created yet. notify receives room events and may be nil.
+func NewParticipant(id string, publisher, subscriber *peer.Peer, notify Notifier) *Participant {
+	return &Participant{id: id, publisher: publisher, subscriber: subscriber, notify: notify, muted: make(map[string]bool)}
+}
+
+func (p *Participant) send(e Event) {
+	if p.notify != nil {
+		p.notify(e)
+	}
+}
+
+func (p *Participant) info() ParticipantInfo {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return ParticipantInfo{ID: p.id, Muted: maps.Clone(p.muted)}
+}
+
+func (p *Participant) setMuted(source string, muted bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.muted[source] = muted
 }
 
 // ID returns the participant identifier, unique within a room.

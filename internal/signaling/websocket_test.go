@@ -69,6 +69,9 @@ func next(t *testing.T, conn *websocket.Conn) Message {
 func expectError(t *testing.T, conn *websocket.Conn, contains string) {
 	t.Helper()
 	msg := next(t, conn)
+	for msg.Type == TypeOffer { // the subscriber offer may arrive in between
+		msg = next(t, conn)
+	}
 	if msg.Type != TypeError || !strings.Contains(msg.Message, contains) {
 		t.Fatalf("got %+v, want error containing %q", msg, contains)
 	}
@@ -211,6 +214,61 @@ func expectClosed(t *testing.T, conn *websocket.Conn) {
 				t.Fatal("connection was not closed by the server")
 			}
 			return
+		}
+	}
+}
+
+func TestJoinedListsOthersAndEventsFollow(t *testing.T) {
+	srv, _ := newTestServer(t)
+	alice := dial(t, srv)
+	send(t, alice, Message{Type: TypeJoin, Room: "r1", Participant: "alice"})
+	first := next(t, alice)
+	if first.Type != TypeJoined || first.Participants == nil || len(first.Participants) != 0 {
+		t.Fatalf("alice joined = %+v, want empty participants list", first)
+	}
+	muted := true
+	send(t, alice, Message{Type: TypeMute, Source: "microphone", Muted: &muted})
+
+	bob := dial(t, srv)
+	send(t, bob, Message{Type: TypeJoin, Room: "r1", Participant: "bob"})
+	joined := next(t, bob)
+	if joined.Type != TypeJoined || len(joined.Participants) != 1 ||
+		joined.Participants[0].ID != "alice" || !joined.Participants[0].Muted["microphone"] {
+		t.Fatalf("bob joined = %+v, want alice with muted microphone", joined)
+	}
+
+	// Alice hears about bob, then about bob's mute, then bob leaving.
+	if msg := nextOfType(t, alice, TypeParticipantJoined); msg.Participant != "bob" {
+		t.Errorf("participant-joined = %+v", msg)
+	}
+	off := true
+	send(t, bob, Message{Type: TypeMute, Source: "camera", Muted: &off})
+	if msg := nextOfType(t, alice, TypeMute); msg.Participant != "bob" || msg.Source != "camera" || msg.Muted == nil || !*msg.Muted {
+		t.Errorf("mute = %+v", msg)
+	}
+	send(t, bob, Message{Type: TypeLeave})
+	if msg := nextOfType(t, alice, TypeParticipantLeft); msg.Participant != "bob" {
+		t.Errorf("participant-left = %+v", msg)
+	}
+}
+
+func TestInvalidMuteRejected(t *testing.T) {
+	srv, _ := newTestServer(t)
+	conn := dial(t, srv)
+	join(t, conn, "r1", "alice")
+	muted := true
+	send(t, conn, Message{Type: TypeMute, Source: "hologram", Muted: &muted})
+	expectError(t, conn, "valid source")
+	send(t, conn, Message{Type: TypeMute, Source: "camera"})
+	expectError(t, conn, "valid source")
+}
+
+// nextOfType skips messages until one of type typ arrives.
+func nextOfType(t *testing.T, conn *websocket.Conn, typ string) Message {
+	t.Helper()
+	for {
+		if msg := next(t, conn); msg.Type == typ {
+			return msg
 		}
 	}
 }

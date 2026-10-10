@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"time"
 
+	apidocs "github.com/mo-nada/sfu-engine/api"
 	"github.com/mo-nada/sfu-engine/internal/config"
 	"github.com/mo-nada/sfu-engine/internal/room"
 	"github.com/mo-nada/sfu-engine/internal/signaling"
@@ -27,8 +28,8 @@ type App struct {
 }
 
 // New creates an App from a validated config. It wires the Pion API, the
-// room manager, the WebSocket signaling handler at /ws and the browser demo
-// page at /.
+// room manager, the WebSocket signaling handler at /ws, the browser demo
+// page at /, and the API documents and their viewers at /api and /docs.
 func New(cfg config.Config, logger *slog.Logger) (*App, error) {
 	api, err := transport.NewAPI()
 	if err != nil {
@@ -44,6 +45,10 @@ func New(cfg config.Config, logger *slog.Logger) (*App, error) {
 	})
 	mux.Handle("GET /ws", sig)
 	mux.Handle("GET /{$}", web.Handler())
+	mux.Handle("GET /docs", web.Docs())
+	mux.Handle("GET /docs/signaling", web.SignalingDocs())
+	mux.Handle("GET /api/openapi.yaml", web.File("application/yaml", apidocs.OpenAPI))
+	mux.Handle("GET /api/asyncapi.yaml", web.File("application/yaml", apidocs.AsyncAPI))
 
 	return &App{
 		cfg:       cfg,

@@ -14,6 +14,7 @@ import (
 
 	"github.com/mo-nada/sfu-engine/internal/peer"
 	"github.com/mo-nada/sfu-engine/internal/room"
+	"github.com/mo-nada/sfu-engine/internal/sfu"
 )
 
 const (
@@ -21,6 +22,9 @@ const (
 	writeTimeout   = 10 * time.Second
 	pongTimeout    = 60 * time.Second
 	pingInterval   = 30 * time.Second
+	// sendQueueSize bounds the messages waiting for one client. A client that
+	// falls this far behind is too slow and is disconnected.
+	sendQueueSize = 256
 )
 
 // Handler accepts WebSocket connections and runs one session per connection.
@@ -54,7 +58,14 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		return // Upgrade has already written the HTTP error.
 	}
-	s := &session{h: h, conn: conn, logger: h.logger.With("remote", r.RemoteAddr), done: make(chan struct{})}
+	s := &session{
+		h:          h,
+		conn:       conn,
+		logger:     h.logger.With("remote", r.RemoteAddr),
+		done:       make(chan struct{}),
+		out:        make(chan Message, sendQueueSize),
+		writerDone: make(chan struct{}),
+	}
 
 	h.mu.Lock()
 	if h.closed {
@@ -66,12 +77,14 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	h.mu.Unlock()
 
 	s.logger.Debug("signaling connected")
+	go s.writeLoop()
 	go s.pingLoop()
 	s.readLoop()
 	s.close()
 }
 
-// Close closes every session and refuses new ones.
+// Close closes every session and refuses new ones. Sessions close in
+// parallel, so one stuck client does not delay the others.
 func (h *Handler) Close() {
 	h.mu.Lock()
 	h.closed = true
@@ -81,21 +94,26 @@ func (h *Handler) Close() {
 	}
 	h.mu.Unlock()
 
+	var wg sync.WaitGroup
 	for _, s := range sessions {
-		s.close()
+		wg.Go(s.close)
 	}
+	wg.Wait()
 }
 
-// session is one client connection. Messages are handled one at a time by
-// readLoop; writes come from many goroutines and are serialized by writeMu.
+// session is one client connection. It runs three goroutines: readLoop
+// handles incoming messages one at a time, writeLoop is the only writer of
+// messages (send just queues them, so callers never wait on the network), and
+// pingLoop keeps the connection alive.
 type session struct {
 	h      *Handler
 	conn   *websocket.Conn
 	logger *slog.Logger
 	done   chan struct{}
 
-	writeMu sync.Mutex
-	closed  atomic.Bool
+	out        chan Message
+	writerDone chan struct{}
+	closed     atomic.Bool
 
 	mu            sync.Mutex // guards the fields below, set once on join
 	joinLogger    *slog.Logger
@@ -189,6 +207,18 @@ func (s *session) handle(msg Message) bool {
 			logger.Debug("bad ICE candidate", "target", msg.Target, "err", err)
 			s.sendError("invalid candidate")
 		}
+	case TypeMute:
+		if !sfu.ValidSource(msg.Source) || msg.Muted == nil {
+			s.sendError("mute needs a valid source and muted")
+			return true
+		}
+		s.mu.Lock()
+		roomID, participantID := s.roomID, s.participantID
+		s.mu.Unlock()
+		if err := s.h.rooms.SetMuted(roomID, participantID, msg.Source, *msg.Muted); err != nil {
+			logger.Debug("mute failed", "err", err)
+			s.sendError("mute failed")
+		}
 	case TypeLeave:
 		return false
 	default:
@@ -235,7 +265,8 @@ func (s *session) join(roomID, participantID string) {
 		s.send(Message{Type: TypeOffer, SDP: o.SDP})
 	})
 
-	r, err := s.h.rooms.Join(roomID, room.NewParticipant(participantID, pub, sub))
+	notify := func(e room.Event) { s.send(eventMessage(roomID, participantID, e)) }
+	r, err := s.h.rooms.Join(roomID, room.NewParticipant(participantID, pub, sub, notify))
 	if err != nil {
 		_ = pub.Close()
 		_ = sub.Close()
@@ -279,7 +310,7 @@ func (s *session) join(roomID, participantID string) {
 		return
 	}
 
-	s.send(Message{Type: TypeJoined, Room: roomID, Participant: participantID})
+	// "joined" with the roster was already queued by the room during Join.
 	if err := sub.Negotiate(); err != nil {
 		logger.Warn("initial subscriber offer failed", "err", err)
 	}
@@ -290,19 +321,54 @@ func (s *session) failJoin(logger *slog.Logger, err error) {
 	s.sendError("join failed")
 }
 
-// send writes msg. A failed write ends the session.
+// send queues msg for writeLoop. It never blocks: if the queue is full, the
+// client is too slow and the session ends.
 func (s *session) send(msg Message) {
-	s.writeMu.Lock()
-	defer s.writeMu.Unlock()
 	if s.closed.Load() {
 		return
 	}
+	select {
+	case s.out <- msg:
+	default:
+		s.logger.Warn("signaling client too slow, disconnecting")
+		go s.close()
+	}
+}
+
+// writeLoop writes queued messages in order. When the session closes, it
+// flushes what is still queued (for example the error that ended the
+// session) and exits.
+func (s *session) writeLoop() {
+	defer close(s.writerDone)
+	for {
+		select {
+		case msg := <-s.out:
+			if !s.write(msg) {
+				go s.close()
+				return
+			}
+		case <-s.done:
+			for {
+				select {
+				case msg := <-s.out:
+					if !s.write(msg) {
+						return
+					}
+				default:
+					return
+				}
+			}
+		}
+	}
+}
+
+func (s *session) write(msg Message) bool {
 	_ = s.conn.SetWriteDeadline(time.Now().Add(writeTimeout))
 	if err := s.conn.WriteJSON(msg); err != nil {
 		s.logger.Debug("signaling write failed", "err", err)
-		// send may run inside a Pion callback, so do not close peers here.
-		go s.close()
+		return false
 	}
+	return true
 }
 
 func (s *session) sendError(text string) {
@@ -346,10 +412,30 @@ func (s *session) close() {
 		s.h.rooms.Leave(roomID, participantID)
 	}
 
-	s.writeMu.Lock()
+	// Wait for writeLoop to flush. close never runs on the writeLoop goroutine
+	// (it calls close with go), so this cannot wait for itself.
+	<-s.writerDone
 	_ = s.conn.WriteControl(websocket.CloseMessage,
 		websocket.FormatCloseMessage(websocket.CloseNormalClosure, ""), time.Now().Add(time.Second))
 	_ = s.conn.Close()
-	s.writeMu.Unlock()
 	s.logger.Debug("signaling closed")
+}
+
+// eventMessage turns a room event for participantID into a signaling message.
+func eventMessage(roomID, participantID string, e room.Event) Message {
+	switch e.Kind {
+	case room.EventRoster:
+		infos := make([]ParticipantInfo, 0, len(e.Roster))
+		for _, p := range e.Roster {
+			infos = append(infos, ParticipantInfo{ID: p.ID, Muted: p.Muted})
+		}
+		return Message{Type: TypeJoined, Room: roomID, Participant: participantID, Participants: infos}
+	case room.EventJoined:
+		return Message{Type: TypeParticipantJoined, Participant: e.Participant}
+	case room.EventLeft:
+		return Message{Type: TypeParticipantLeft, Participant: e.Participant}
+	default: // room.EventMuted
+		muted := e.Muted
+		return Message{Type: TypeMute, Participant: e.Participant, Source: e.Source, Muted: &muted}
+	}
 }

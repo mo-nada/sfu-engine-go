@@ -1,0 +1,28 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>SFU Engine – Signaling API</title>
+<!-- The AsyncAPI viewer is loaded from the public unpkg CDN. -->
+<link rel="stylesheet" href="https://unpkg.com/@asyncapi/react-component@latest/styles/default.min.css">
+<style>
+  body { margin: 0; font-family: system-ui, sans-serif; }
+  .note { padding: .6rem 1rem; background: #eef; font-size: .9rem; }
+</style>
+</head>
+<body>
+<div class="note">
+  WebSocket signaling protocol. HTTP endpoints: <a href="/docs">/docs</a>.
+  Raw document: <a href="/api/asyncapi.yaml">asyncapi.yaml</a>.
+</div>
+<div id="asyncapi"></div>
+<script src="https://unpkg.com/@asyncapi/react-component@latest/browser/standalone/index.js"></script>
+<script>
+  AsyncApiStandalone.render({
+    schema: { url: "/api/asyncapi.yaml" },
+    config: { show: { sidebar: true } },
+  }, document.getElementById("asyncapi"));
+</script>
+</body>
+</html>

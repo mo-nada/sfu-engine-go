@@ -1,0 +1,26 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>SFU Engine – HTTP API</title>
+<!-- Swagger UI is loaded from the public unpkg CDN. -->
+<link rel="stylesheet" href="https://unpkg.com/swagger-ui-dist@5/swagger-ui.css">
+<style>
+  body { margin: 0; font-family: system-ui, sans-serif; }
+  .note { padding: .6rem 1rem; background: #eef; font-size: .9rem; }
+</style>
+</head>
+<body>
+<div class="note">
+  HTTP endpoints. Most of the API is WebSocket signaling:
+  see <a href="/docs/signaling">the signaling protocol</a>.
+  Raw documents: <a href="/api/openapi.yaml">openapi.yaml</a>, <a href="/api/asyncapi.yaml">asyncapi.yaml</a>.
+</div>
+<div id="swagger-ui"></div>
+<script src="https://unpkg.com/swagger-ui-dist@5/swagger-ui-bundle.js"></script>
+<script>
+  SwaggerUIBundle({ url: "/api/openapi.yaml", dom_id: "#swagger-ui" });
+</script>
+</body>
+</html>

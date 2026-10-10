@@ -343,8 +343,8 @@ Focus on a minimal, correct, testable WebRTC SFU engine.
 
 Before making changes:
 
-1. Inspect the existing repository and identify what is already implemented.
-2. Read `go.mod`, existing packages, tests, and documentation.
+1. Read `platform-context.md` first. It summarizes the architecture, ownership, protocol, key decisions, and stage history. Open source files only for the parts you will change or when the summary is not enough.
+2. Read `go.mod` and the packages, tests, and documentation relevant to the change.
 3. Follow the current architecture unless there is a clear, documented reason to change it.
 4. Identify the smallest implementation step that advances the current phase.
 
@@ -356,6 +356,8 @@ When implementing a feature:
 4. Run formatting, tests, and static checks where available.
 5. Fix regressions introduced by the change.
 6. Update documentation when behavior or public APIs change.
+7. In the same change, keep the API documents current: `api/openapi.yaml` for HTTP endpoints and `api/asyncapi.yaml` for WebSocket signaling messages. Other systems integrate from these files, so every endpoint, message, field, and error rule must match the code.
+8. In the same change, update `platform-context.md` when architecture, ownership, protocol, public API, endpoints, or key decisions change, and add the stage to its history.
 
 Do not create placeholder files for every future feature. Do not claim that tests passed unless they were actually executed successfully.
 

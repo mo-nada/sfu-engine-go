@@ -1,0 +1,126 @@
+openapi: 3.1.0
+info:
+  title: SFU Engine HTTP API
+  version: 0.2.0
+  summary: HTTP endpoints of the Go WebRTC SFU engine.
+  description: |
+    The SFU has a small HTTP surface. Almost all interaction happens over the
+    WebSocket signaling connection at `/ws`. Its messages are described in the
+    AsyncAPI document at `/api/asyncapi.yaml` (rendered at `/docs/signaling`).
+
+    There is no authentication yet: anyone who can reach the server can join
+    any room. Browsers may only open `/ws` from pages served by the same host.
+  license:
+    name: See repository
+servers:
+  - url: http://localhost:8080
+    description: Local development server (default `-addr :8080`)
+tags:
+  - name: signaling
+    description: WebRTC signaling over WebSocket
+  - name: operations
+    description: Health and documentation
+  - name: demo
+    description: Browser demo client
+paths:
+  /ws:
+    get:
+      tags: [signaling]
+      operationId: openSignaling
+      summary: Open the WebSocket signaling connection
+      description: |
+        Upgrades the request to a WebSocket. Send a `join` message first, then
+        follow the protocol in `/api/asyncapi.yaml`. Messages are JSON text
+        frames of at most 64 KB. The server pings every 30 seconds and closes
+        the connection after 60 seconds without a pong.
+      parameters:
+        - name: Upgrade
+          in: header
+          required: true
+          schema: { type: string, enum: [websocket] }
+        - name: Connection
+          in: header
+          required: true
+          schema: { type: string, example: Upgrade }
+        - name: Sec-WebSocket-Version
+          in: header
+          required: true
+          schema: { type: string, enum: ["13"] }
+        - name: Sec-WebSocket-Key
+          in: header
+          required: true
+          schema: { type: string }
+      responses:
+        "101":
+          description: Switching protocols; the WebSocket is open.
+        "400":
+          description: Not a valid WebSocket upgrade request.
+        "403":
+          description: Cross-origin browser request rejected.
+  /healthz:
+    get:
+      tags: [operations]
+      operationId: health
+      summary: Health check
+      responses:
+        "200":
+          description: The server is running.
+          content:
+            text/plain:
+              schema: { type: string, const: ok }
+  /:
+    get:
+      tags: [demo]
+      operationId: demoPage
+      summary: Browser demo page
+      description: A page to join a room with camera, microphone and screen share.
+      responses:
+        "200":
+          description: The demo page.
+          content:
+            text/html:
+              schema: { type: string }
+  /docs:
+    get:
+      tags: [operations]
+      operationId: httpDocs
+      summary: This document, rendered with Swagger UI
+      responses:
+        "200":
+          description: HTML page. Loads Swagger UI from a public CDN.
+          content:
+            text/html:
+              schema: { type: string }
+  /docs/signaling:
+    get:
+      tags: [operations]
+      operationId: signalingDocs
+      summary: The signaling protocol, rendered with the AsyncAPI viewer
+      responses:
+        "200":
+          description: HTML page. Loads the AsyncAPI viewer from a public CDN.
+          content:
+            text/html:
+              schema: { type: string }
+  /api/openapi.yaml:
+    get:
+      tags: [operations]
+      operationId: openapiSpec
+      summary: This OpenAPI document
+      responses:
+        "200":
+          description: OpenAPI 3.1 document.
+          content:
+            application/yaml:
+              schema: { type: string }
+  /api/asyncapi.yaml:
+    get:
+      tags: [operations]
+      operationId: asyncapiSpec
+      summary: The AsyncAPI document for WebSocket signaling
+      responses:
+        "200":
+          description: AsyncAPI 3.0 document.
+          content:
+            application/yaml:
+              schema: { type: string }
